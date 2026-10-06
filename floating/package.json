@@ -1,0 +1,60 @@
+{
+  "name": "crystal-vault-float",
+  "productName": "CrystalFloat",
+  "version": "1.0.0",
+  "description": "把晶体库的边看边记与结构窗浮在其它窗口之上。",
+  "main": "main.cjs",
+  "author": "runyao-zhang",
+  "license": "GPL-3.0",
+  "private": true,
+  "comment_type": "⚠️ 不要加 \"type\": \"module\"。主进程和预加载都是 .cjs（esbuild 打的 CJS），显式扩展名已经把话说清楚了；而插件仓那边有过一次教训——给一个跑 CJS 的包加 type:module，Node 会把它当 ESM 加载，产出一个**空模块**且不报错。",
+  "comment_build": "⚠️ `build` 里**不许放注释键**（electron-builder 26 会严格校验 schema，多一个未知属性就直接拒绝打包，报的是「unknown property」）。所以这个文件里的解释一律放在 `build` 外面，也就是你现在读的这几行。",
+  "comment_electronVersion": "⚠️ build.electronVersion 必须与根 package.json 的 devDependencies.electron 一致，而且**必须是精确版本**（不能是 ^44.5.1 这种范围——electron-builder 要按它下平台二进制，范围它解析不了，实测报错）。scripts/build.mjs 和 scripts/land-float.mjs 各有一道检查守着；漂了的症状是「打出来的包在买家机器上白屏」。",
+  "comment_nsis": "perMachine:false + oneClick:false = **免管理员**、可选安装目录，买家双击装、不弹 UAC。portable 那份是给「我不装东西」的人——单个自解压 exe。",
+  "comment_sign": "⚠️ 没签名。未签名的 exe 首次运行会撞 SmartScreen「Windows 保护了你的电脑」——那一个弹窗丢的买家比体积本身多。有预算就去签，没预算至少在 README 里放「更多信息 → 仍要运行」的截图。",
+  "comment_files": "`files` 是**白名单**：只打应用真正要的那几个文件。核心全被 bundle.js 打进去了，没有运行时要装的依赖。",
+  "build": {
+    "appId": "com.runyaozhang.crystalfloat",
+    "productName": "CrystalFloat",
+    "electronVersion": "44.5.1",
+    "directories": {
+      "output": "../../dist/float-dist"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "index.html",
+      "theme.css",
+      "styles.css",
+      "bundle.js",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "CrystalFloat",
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "CrystalFloat-portable-${version}.${ext}",
+      "unicode": true
+    }
+  }
+}

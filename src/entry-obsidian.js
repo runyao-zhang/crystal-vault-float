@@ -1,0 +1,1197 @@
+// Obsidian 适配层 —— 14 个宿主触点（对 ADAPTER_METHODS 数）全部收敛在这里，核心不碰 app/dv。
+//
+// 落回 vault 时，dataviewjs 代码块里只有一行：
+//   await ARI.bootObsidian(dv, this.container);
+
+import { mount } from "./core/app.js";
+import { toStr } from "./core/dom.js";
+import { parseSidesField, SIDES_FIELD } from "./core/frontmatter.js";
+import { toLinkTarget, viewStateKey, prefsKey } from "./adapter.js";
+import { CARDS_FOLDER, VAULT_PDF_RUNTIME_PATH } from "./config.js";
+import { createLazyPdfRenderer } from "./core/pdfdoc.js";
+
+// ⚠️ **这里不许 import pdf.js。**
+//
+// 一开始是 import 的，esbuild 就把它合进了那张 markdown 笔记——笔记从 7,665 行
+// 涨到 30,260 行、346KB 涨到 2.6MB，Obsidian 的编辑器**直接打不开它**；
+// 而块在笔记里，笔记打不开，块就永远没机会跑。pdf.js 现在是 vault 里另外一份
+// .js（`dist/pdf-runtime.js` 落过去的），由下面 readPdfRuntime 按需读进来。
+//
+// 这条没有任何自动检查守得住「你别 import」这个动作本身，但**有守得住结果的**：
+// scripts/build.mjs 末尾会体检那份产物的行数与体积，超了直接失败。
+
+/**
+ * 3.0 刀 55：上一次成功借到的「宿主编辑器类」。
+ *
+ * 借类这件事**只能从活着的实例上取**（Obsidian 不导出编辑器类），而用户平时
+ * 根本不打开 .md 标签页 —— 于是每一次点「编辑」都借不到、都掉进降级那条路。
+ * 借成一次就记在这儿，本会话内一直有效（模块级 = 整个插件一份）。
+ */
+let editorBorrow = null;
+
+// 文献阅读器认得的扩展名。**pptx 不在里面，也不打算加**——Obsidian 和 pdf.js
+// 都渲染不了它，收进来只会变成一条「点了没反应」的条目。用户自己导出成 PDF、
+// 或导出成每页一张图再进来（3.0 路线图·刀 6 里写明了）。
+const DOC_KINDS = {
+  pdf: "pdf",
+  png: "image",
+  jpg: "image",
+  jpeg: "image",
+  gif: "image",
+  webp: "image",
+  bmp: "image",
+  svg: "image",
+  avif: "image",
+  md: "markdown",
+};
+
+// watchCards 的防抖窗口。与视图状态落盘那个 250ms 同一个量级，取 400 是因为
+// 它挡的是**别人写完盘之后的一连串余波**（同步落盘、metadataCache 重解析），
+// 而不是用户手速——那是「一件事办完了没有」的量级，不是「手停了没有」。
+//
+// 顺带也把「我们自己写盘引起的回声」挡成一次：核心那边还有一道内容比较兜底
+// （见 core/app.js 的 applyExternalChange），两道都在，不是重复。
+const WATCH_DEBOUNCE_MS = 400;
+
+/**
+ * tags 归一成字符串数组。
+ *
+ * **别写回 `(fm.tags || []).map(...)`。** Dataview 的 `p.tags` 一定是数组，
+ * 但 Obsidian 的 frontmatter 是**原样 YAML**：哪张卡写成 `tags: 单个词` 而不是
+ * `[a, b]` 行内列表，读回来就是字符串，`.map` 直接抛 TypeError。
+ *
+ * 而 readCard 在 loadCards 里是**逐张**跑的——抛一张，整次加载就挂了，
+ * 笔记里只剩一句「晶体库挂载失败」。一张卡的 tags 写得随意，不该有这种后果。
+ */
+function tagsOf(v) {
+  if (Array.isArray(v)) return v.map(toStr).filter(Boolean);
+  if (v == null || v === "") return [];
+  return [toStr(v)].filter(Boolean);
+}
+
+/** 异常转一句人能读的话。适配层的错误要能直接显示在界面上，不能是 [object Object]。 */
+function errText(e) {
+  if (!e) return "未知错误";
+  if (typeof e === "string") return e;
+  return String(e.message || e);
+}
+
+/**
+ * Obsidian 适配层。**两个入口共用它**：
+ *   · dataviewjs 那条（`bootObsidian`）—— 传 `dv`，渲染走 Dataview 暴露的原生渲染器；
+ *   · 插件那条（`entry-plugin.js`）—— 不传 `dv`，渲染走 `MarkdownRenderer`。
+ *
+ * 三种参数化，都是为了「一份内核、两扇门」：
+ *   @param {object|null} [dv]        Dataview 的 dv 对象。**没有也能跑**（插件里就没有）。
+ *   @param {object}      app         Obsidian 的 app。两条路都要。
+ *   @param {string}      [cardsFolder] 卡片目录。默认取 config 里那个写死的值；
+ *                                     插件版从设置里来。
+ *   @param {Function}    [renderMd]  自己实现渲染时用（插件版传 MarkdownRenderer 的封装）。
+ *                                   给了它就不看 `dv`。
+ */
+export function createObsidianAdapter({
+  dv = null,
+  app,
+  cardsFolder = CARDS_FOLDER,
+  renderMd = null,
+  store = null,
+}) {
+  // 键带卡片目录路径：同一个人的多个 vault 不能共用一个全局键。
+  // 代价是各端布局独立（桌面排好的画布不会同步到手机），这条在 #9 里已记录接受。
+  const viewKey = viewStateKey(cardsFolder);
+  // #22 偏好另存一个键：清「上次看到哪儿」不该把用户调好的颜色也清掉
+  const prefKey = prefsKey(cardsFolder);
+
+  /**
+   * 「上次看到哪儿」和偏好往哪儿写。
+   *
+   * 契约是**两个方法、进出都是 JSON 字符串**（不是解析好的对象）：
+   *   `store.get(key) -> string | null`、`store.set(key, str)`
+   *
+   * 定成字符串是有意的——这样默认那条路（localStorage）和从前**逐字节等价**，
+   * 而它是真正被日常使用和测试覆盖的那一条；换后端只是换一个实现，
+   * 解析、容错、脏数据兜底那些逻辑一份都不用重写。
+   *
+   * 插件形态传自己的 store（落在 `plugin.saveData` 里，跟着 vault 走），
+   * dataviewjs 形态不传，用下面这个默认的。
+   */
+  const backing =
+    store ||
+    {
+      get(key) {
+        try {
+          return window.localStorage.getItem(key);
+        } catch (e) {
+          return null;
+        }
+      },
+      set(key, str) {
+        try {
+          window.localStorage.setItem(key, str);
+        } catch (e) {
+          // 存储写满或被禁用：状态丢就丢了，不该影响界面能用
+        }
+      },
+    };
+
+  // 读全文的唯一入口。**loadCards 与 writeCard 的基线比对必须走同一条路**——
+  // 两条路要是在行尾规范化（CRLF/LF）或解码上有任何差别，核心每次保存都会拿到
+  // 一个与磁盘「看起来不一样」的基线，于是每次保存都报「在别处被改过」这种假冲突，
+  // 而用户什么都没动过。这类 bug 只在真机上、只在有 CRLF 文件时出现，最难查。
+  async function readText(path) {
+    try {
+      const file = app.vault.getAbstractFileByPath(path);
+      if (file) return await app.vault.read(file);
+    } catch (e) {
+      // 落到下面的低层读
+    }
+    return app.vault.adapter.read(path);
+  }
+
+  /** 这颗叶子是不是一个正常的 markdown 视图（插件自己那颗不是）。 */
+  function isMarkdownLeaf(leaf) {
+    try {
+      return !!(leaf && leaf.view && leaf.view.getViewType && leaf.view.getViewType() === "markdown");
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * 3.0 刀 39：**最近用过的那个 markdown 叶子**（没有就 null）。
+   *
+   * 存在的理由见 `openNote` 里那段：晶体库在浮窗/嵌入档下**自己占着一颗叶子**，
+   * 而"当前活动的叶子"可能是它——拿它当基准去分屏，用户看到的是一颗空标签页。
+   * 这里挑一颗**真能装下笔记**的叶子。
+   *
+   * 先问 `getMostRecentLeaf()`（那正是"用户上一篇在看的"），没有再逐个找。
+   * 两步都包在 try 里：这两个 API 在某些宿主版本上可能不在，而没有它只是
+   * 退回老行为（`openNote` 那条兜底），不该把打开笔记这件事整个弄崩。
+   */
+  function markdownLeaf() {
+    try {
+      const recent = app.workspace.getMostRecentLeaf ? app.workspace.getMostRecentLeaf() : null;
+      if (isMarkdownLeaf(recent)) return recent;
+    } catch (e) {
+      /* 往下逐个找 */
+    }
+    let hit = null;
+    try {
+      app.workspace.iterateAllLeaves((l) => {
+        if (!hit && isMarkdownLeaf(l)) hit = l;
+      });
+    } catch (e) {
+      return null;
+    }
+    return hit;
+  }
+
+  /**
+   * 把一个 vault 文件读成契约里的 Card（见 adapter.js）。
+   * **loadCards 与 watchCards 共用这一条读法**：两处要是各自拼一遍，
+   * 字段名或取值方式迟早漂移，表现是「外部改动刷新出来的卡跟重新加载的不一样」。
+   */
+  async function readCard(file) {
+    // 字段值走 metadataCache，与下面 resolveLink 同一个出处。
+    // 刚从别处同步下来、cache 还没解析完的文件拿不到 frontmatter——按空处理，
+    // 不报错：那次改动随后会再来一记（cache 就绪后 metadataCache 也会变）。
+    const fm = (app.metadataCache.getFileCache(file) || {}).frontmatter || {};
+    let content = "";
+    try {
+      content = await readText(file.path);
+    } catch (e) {
+      content = "";
+    }
+    return {
+      path: file.path,
+      folder: toStr(file.parent && file.parent.path),
+      name: toStr(file.basename),
+      concept: toStr(fm["概念"]),
+      tags: tagsOf(fm.tags),
+      source: toStr(fm["来源"]),
+      // 3.0 刀 34：卡片在故事线里的**格坐标**（左下角），存在它自己的 frontmatter 里。
+      // 只认 `[数, 数]` 这一个形状——一个手滑写歪的字符串（"3,2"）在这儿就当没有，
+      // 不去 `split` 猜：猜错的话整屏卡片的位置会以"看起来很正常"的方式全部错位。
+      pos: posOf(fm["晶体坐标"]),
+      // 3.0 刀 46：卡片亲手设过的**连线接法**（frontmatter「晶体接法」）。
+      // 写进卡片自己身上是为了让它**跟着文件走**——改名、搬到别的文件夹、
+      // 压缩发给别人，都带着（以前只活在本机视图状态里，一发走就没了）。
+      // ⚠️ 解析器**只有一份**（frontmatter.js 的 `parseSidesField`），
+      //    模型和假适配层调的是同一个——不像 `posOf` / `posPair` 那样各抄一遍。
+      sides: parseSidesField(fm[SIDES_FIELD]),
+      content,
+    };
+  }
+
+  /** frontmatter 里的 `晶体坐标` → `[gx, gy]`；形状不对就回 null（当没写过）。 */
+  function posOf(raw) {
+    if (!Array.isArray(raw) || raw.length < 2) return null;
+    const gx = Number(raw[0]);
+    const gy = Number(raw[1]);
+    if (!Number.isFinite(gx) || !Number.isFinite(gy)) return null;
+    return [gx, gy];
+  }
+
+  /**
+   * 卡片目录那一棵子树里的**全部文件与文件夹**。
+   *
+   * ⚠️ 这里**故意不用 `vault.getFiles()` / `getMarkdownFiles()` / `getAllLoadedFiles()`**
+   * （3.0 刀 11）。那三个返回的都是**整个 vault** 的文件表——这个插件只管知识卡片，
+   * 却把用户所有笔记的路径都过了一遍。内容一个字节都没读，但「列了一遍」这件事
+   * 本身，在社区目录的自动审查里是一条独立的建议项（Vault Enumeration），
+   * 而**它还说得对**。
+   *
+   * 换成从卡片目录顺着 `children` 往下走。好处不只是过审：
+   * **范围就是用户在设置里指的那个目录**，换成哪个就只看哪个，
+   * 别的文件夹连名字都不进内存。dataviewjs 形态下这个目录是写死的常量，
+   * 那时这条改进照样成立（只是没有设置可换）。
+   *
+   * 目录不存在（还没建、或者路径填错）时返回空——那时库里本来就一张卡都没有，
+   * **空是对的答案**，不是错误。
+   */
+  function walkCardsFolder() {
+    const rootPath = toStr(cardsFolder).replace(/\/+$/, "");
+    const root = rootPath && app.vault.getFolderByPath ? app.vault.getFolderByPath(rootPath) : null;
+    const files = [];
+    const folders = [];
+    if (!root) return { rootPath, root: null, files, folders };
+    const walk = (folder) => {
+      for (const child of folder.children || []) {
+        // 宿主用 `children` 区分文件夹与文件（同下面 listFolders 的老判据）
+        if (child.children !== undefined) {
+          folders.push(child);
+          walk(child);
+        } else {
+          files.push(child);
+        }
+      }
+    };
+    walk(root);
+    return { rootPath, root, files, folders };
+  }
+
+  return {
+    // ⚠️ 这里**故意不用 `dv.pages()`**，别改回去。
+    //
+    // Dataview 会把一次查询碰过的文件登记成**这个块的依赖**，此后任何一个依赖文件
+    // 被写盘，它就把整个 dataviewjs 块重跑一遍：宿主销毁容器 → 重建 → 从头 mount。
+    // 表现就是用户报的「保存后闪退」——晶体库肉眼可见地关掉再开，而且 `loadCards`
+    // 那一趟全量读盘整段挡在清理旧 DOM 之前（见 core/app.js 的 mount）。
+    //
+    // 于是这里绕开 Dataview 自己的查询，改走 vault 的文件表 + metadataCache：
+    // 本块在 Dataview 眼里从此**没有任何依赖**，写盘不再触发重跑。
+    // 「外部改动要能自动出现」由契约里的 watchCards 负责，那条路是增量的。
+    async loadCards() {
+      const files = walkCardsFolder().files.filter((f) => f.path.toLowerCase().endsWith(".md"));
+      // 并行读：原来是逐个 await，30 张卡就是 30 个来回串起来。
+      // 这一趟现在只在挂载时跑一次，但仍然是最长的等待，没有理由串着做。
+      return Promise.all(files.map((f) => readCard(f)));
+    },
+
+    /**
+     * 外部改动。三个来源：多设备同步（FNS 把别的设备上的改动拖下来）、
+     * 用户在分屏/别处手改这张卡、别的插件改盘。这些核心自己听不见——
+     * 关掉 Dataview 自动刷新之后尤其听不见，所以这条路必须补上。
+     */
+    watchCards(cb) {
+      // 宿主的事件比核心想要的密得多：一次保存连着来 modify + metadataCache changed，
+      // 一次同步拖下来更是连着来一串。在这里就压成一记——核心连「事件有多密」
+      // 都不该知道，那是宿主的事。
+      const pending = new Map(); // path -> { file, from }，一记窗口内同一个文件只算一次
+      const dead = new Set(); // 路径没了的那些（删除 / 移出卡片目录）
+      let timer = 0;
+      const flush = async () => {
+        const files = Array.from(pending.values());
+        const lost = Array.from(dead);
+        pending.clear();
+        dead.clear();
+        // 先报「没了」。改名会同时产生「旧路径消失」和「新路径出现」两条，
+        // 而核心那边是拿**盘上现在有什么**重新对账的，先后其实不影响结果——
+        // 但先清旧的读起来顺。
+        for (const p of lost) cb(null, undefined, p);
+        for (const it of files) {
+          let card;
+          try {
+            card = await readCard(it.file);
+          } catch (e) {
+            continue; // 读不出来（正被删/改名）就别惊动核心
+          }
+          cb(card, it.from);
+        }
+      };
+      const schedule = () => {
+        clearTimeout(timer);
+        timer = setTimeout(flush, WATCH_DEBOUNCE_MS);
+      };
+      const bump = (file, from) => {
+        const path = file && file.path;
+        // 前缀一定带斜杠：不带的话「知识卡片2」这种同前缀目录会被误伤
+        if (!path || !path.startsWith(cardsFolder + "/") || !path.endsWith(".md")) return;
+        // `from` 只有改名那一支有。核心靠它知道「这张卡以前在哪儿」——
+        // 没有它的话，一个被改名的卡在核心眼里就是「一张没见过的卡」，
+        // 而那条路是直接 return 的（见 app.js 那句「不是我们的卡」）。
+        pending.set(path, { file, from: toStr(from) });
+        schedule();
+      };
+      // 3.0 刀 21：删除。**读不到文件**，所以不能走 `bump`（它里面要 readCard）——
+      // 只把这个路径推给核心，让它知道那份卡已经不在了。
+      const gone = (file) => {
+        const path = file && file.path;
+        if (!path || !path.startsWith(cardsFolder + "/") || !path.endsWith(".md")) return;
+        dead.add(path);
+        schedule();
+      };
+      // 两处都要听，理由不同：
+      //   vault.modify          —— 内容变了（别处改盘、别的设备同步下来）
+      //   metadataCache.changed —— 字段值变了。**必须单独听这一个**：getFileCache
+      //     在写盘之后有一小段时间还是旧的，只靠前一个事件会读到「新正文 + 旧字段」，
+      //     把过期字段写进模型——而后面再没有第三个事件来纠正它，那张卡的概念/来源
+      //     就这么错下去，直到重开。
+      // 两个事件会被 400ms 的防抖收进同一记（按 path 去重），不会重复读盘。
+      // 3.0 刀 21 起还听**改名**与**删除**，因为光有「内容变了」是不够的：
+      // 改一张卡的名字，核心只看得见「别的卡正文里的 [[甲]] 变成了 [[乙]]」，
+      // 而 `乙` 从没进过它的 byPath——于是给 [[乙]] 登记一张**内容为空的影子卡**
+      // （灰色、「暂无描述」、点进去什么都没有）。用户 09-24 报的就是这个。
+      //
+      // ⚠️ **`create` 故意不订**：我们自己建的卡走 `addCard`（已经登记过了），
+      // 而「外面新增一张卡」是另一个特性。这是有意留白，不是漏了。
+      const refModify = app.vault.on("modify", (f) => bump(f));
+      const refMeta = app.metadataCache.on("changed", (file) => bump(file));
+      const refRename = app.vault.on("rename", (file, oldPath) => bump(file, oldPath));
+      const refDelete = app.vault.on("delete", (file) => gone(file));
+      return () => {
+        clearTimeout(timer);
+        pending.clear();
+        dead.clear();
+        app.vault.offref(refModify);
+        app.metadataCache.offref(refMeta);
+        app.vault.offref(refRename);
+        app.vault.offref(refDelete);
+      };
+    },
+
+    resolveLink(target, fromPath) {
+      const clean = String(target || "").split("#")[0];
+      const dest = app.metadataCache.getFirstLinkpathDest(clean, fromPath);
+      if (!dest) return null;
+      const fc = app.metadataCache.getCache(dest.path);
+      const fm = (fc && fc.frontmatter) || {};
+      return toLinkTarget({
+        path: dest.path,
+        name: toStr(dest.basename),
+        concept: toStr(fm["概念"]),
+        tags: tagsOf(fm.tags),
+        source: toStr(fm["来源"]),
+      });
+    },
+
+    // Obsidian 侧由原生渲染器自己解析图片，核心不会调到这里。
+    // 保留是因为它是契约的一部分，换宿主时需要它。
+    assetUrl(path) {
+      try {
+        const dest = app.metadataCache.getFirstLinkpathDest(String(path || ""), "");
+        return dest ? app.vault.getResourcePath(dest) : "";
+      } catch (e) {
+        return "";
+      }
+    },
+
+    // #5 / ADR-0002：正文整段交给**宿主的**渲染器，核心不手搓一遍。
+    //
+    // 两条路，同一件事：
+    //   · dataviewjs 里**不能** `require('obsidian')`（会抛 Cannot find module），
+    //     也没有全局 `MarkdownRenderer`（它不是全局变量）——只能借 Dataview 的
+    //     `dv.api.renderValue`，Component 传 `dv.component` 且不要自己 unload()。
+    //   · 插件里反过来：`require('obsidian')` 才是正路，`MarkdownRenderer.render`
+    //     直接可用，Component 传插件自己（`this`）。入口把这件事包成 `renderMd`
+    //     递进来，适配层只负责调它——**判断只留一处**。
+    renderMarkdown(md, el, srcPath) {
+      if (renderMd) return renderMd(md, el, srcPath);
+      return dv.api.renderValue(md, el, dv.component, srcPath || dv.currentFilePath);
+    },
+
+        /**
+     * 3.0 刀 9 第三版：把**宿主自己的 markdown 编辑器**挂进 el（实时预览）。
+     *
+     * ---- 它是**绑文件**的，这一条是用户拍的板（09-18）----
+     *
+     * 中途试过「不绑文件」那条路（`embedRegistry` 造一块只装某段文本的编辑器），
+     * 真机连报三轮：转不出编辑器、位置参数签名不对、owner 差容器……每一轮都在收窄，
+     * 但收窄的速度赶不上它要的轮次。用户改主意：**回滚到绑文件这一版**，
+     * 用两个更朴素的办法解决「一扇窗 = 一段」这件事：
+     *
+     *   1. 打开时**自动定位到第 a 行**（区间起点），不是只装那一段；
+     *   2. 窗子底下给一个「**回到第 __ 行**」，随手填行号就跳过去。
+     *
+     * 于是这里得到的是**百分之百原生的编辑器**——就是平时写笔记那个，
+     * 实时预览、双链补全、搜索替换、撤销栈一样不缺。代价：编辑器里是**整个文件**，
+     * 行号区间退化成「跳到哪儿」。
+     *
+     * ---- ⚠️ 绑文件 = 宿主会自己存盘 ----
+     *
+     * 这一点必须写死在代码里：宿主的编辑器**随编辑自动存盘**。所以
+     *   · 这一支**不能用核心那套「带基线的写盘」**——宿主刚存过，基线当场过期，
+     *     用户一保存就报「在别处被改过」，那是我们自己制造的假冲突；
+     *   · 但也不能不写：万一宿主的自动存盘没接上（我们这套挂法没有文档背书），
+     *     用户改了半天会**一个字都不落盘**。丢字比假冲突严重得多。
+     *
+     * 所以「完成」那一下由**核心**把编辑器里的全文写回去，**不带基线**：
+     * 宿主存过的话这一下是幂等的（同样的内容再写一次），没存过的话这一下就是保命的。
+     *
+     * ---- 还是没有文档背书 ----
+     *
+     * `require('obsidian')` 在 dataviewjs 里是抛的，拿不到 `MarkdownView` 这个类，
+     * 只能**从已经开着的视图实例上把构造函数取下来**。所以每一步都兜住、
+     * 最后还要自检：编辑器没真的长出来（`.cm-editor` 不在）就回 null，
+     * 让核心退回它自己的输入框。**宁可退回输入框，也不要给一块空白。**
+     */
+    /**
+     * 建一个文件夹（= 一颗新晶体）。3.0 刀 9 第三版。
+     *
+     * 用 `vault.createFolder`（它会把父目录一层层补齐，这正是我们要的：
+     * 「在『将建在』那个文件夹里面再开一颗」= 路径多一段而已）。
+     *
+     * 「已经存在」要单独回一个 `exists`，不能混进 `error`：前者的下一句话是
+     * 「换个名字」，后者是「去看看出了什么事」，两件事两个动作。
+     */
+    /**
+     * 列出够格当晶体的文件夹（规则见 adapter.js 的契约）。3.0 刀 9 第三版。
+     *
+     * 走 `getAllLoadedFiles()` 而不是 `getFiles()`——后者只给文件，看不见空文件夹，
+     * 而「空文件夹也要上环」正是这一条存在的理由。
+     */
+    async listFolders() {
+      try {
+        const { rootPath: root, files, folders } = walkCardsFolder();
+        const under = (p) => p === root || p.indexOf(root + "/") === 0;
+        const hasFile = new Set(); // 这个文件夹（含子树）里有文件吗
+        const hasMd = new Set(); // ……有卡片吗
+        const dirs = folders.map((d) => toStr(d.path)).filter((p) => p && p !== root);
+        for (const f of files) {
+          const p = toStr(f.path);
+          if (!p || !under(p)) continue;
+          // 文件：从它所在那一层往上，每一级祖先都记一笔
+          const isMd = p.toLowerCase().endsWith(".md");
+          let cur = toStr(f.parent && f.parent.path);
+          while (cur && under(cur)) {
+            hasFile.add(cur);
+            if (isMd) hasMd.add(cur);
+            if (cur === root) break;
+            const i = cur.lastIndexOf("/");
+            if (i < 0) break;
+            cur = cur.slice(0, i);
+          }
+        }
+        return dirs.filter((d) => hasMd.has(d) || !hasFile.has(d));
+      } catch (e) {
+        return []; // 契约：读不出一律回空数组，绝不抛
+      }
+    },
+
+    async createFolder(folder) {
+      // 去掉结尾的斜杠：`a/b/` 和 `a/b` 是同一个文件夹，不去的话
+      // 第二次建会绕过 exists 判断，建出一个宿主眼里的重复路径。
+      let path = toStr(folder);
+      while (path.endsWith('/')) path = path.slice(0, -1); // 结尾的斜杠去掉：`a/b/` 就是 `a/b`
+      if (!path) return { ok: false, reason: "error", message: "空路径" };
+      const exists = () => {
+        try {
+          return !!app.vault.getAbstractFileByPath(path);
+        } catch (e) {
+          return false;
+        }
+      };
+      try {
+        if (exists()) return { ok: false, reason: "exists" };
+        await app.vault.createFolder(path);
+        return { ok: true, path };
+      } catch (e) {
+        // 并发或宿主自己的判断：再查一次，「其实已经有了」当 exists 回，
+        // 别把一个「换个名字就行」的事报成故障。
+        if (exists()) return { ok: false, reason: "exists" };
+        return { ok: false, reason: "error", message: errText(e) };
+      }
+    },
+
+    /**
+     * 把一个文件或文件夹丢进回收站——**不是永久删除**（3.0 刀 12）。
+     *
+     * 删一整个文件夹 = 里面所有卡片一起没了，这是核心发起的最不可逆的动作。
+     * 所以这里**只请宿主丢回收站**，让用户自己在「文件与链接 → 删除的文件」
+     * 里选的那一档说了算（系统回收站 / vault 里的 .trash / 永久删除）。
+     *
+     * ⚠️ **不许退化成 `vault.delete`**：那是永久删除。用户把设置选成回收站的时候
+     * 用它，等于绕过他的设置——而这一下删掉的是他的笔记。
+     *
+     * 老版本 Obsidian 没有 `fileManager.trashFile`，退到 `vault.trash(f, true)`
+     * （那个也尊重用户的设置）。两个都没有就回 `unsupported`，核心据此不显示按钮。
+     */
+    async trashFile(folder) {
+      const path = toStr(folder).replace(/\/+$/, "");
+      if (!path) return { ok: false, reason: "error", message: "空路径" };
+      let target = null;
+      try {
+        target = app.vault.getAbstractFileByPath(path);
+      } catch (e) {
+        target = null;
+      }
+      if (!target) return { ok: false, reason: "missing", path };
+      try {
+        const fm = app.fileManager;
+        if (fm && typeof fm.trashFile === "function") {
+          await fm.trashFile(target);
+        } else if (typeof app.vault.trash === "function") {
+          await app.vault.trash(target, true); // true = 用系统回收站那一档
+        } else {
+          return { ok: false, reason: "unsupported", path };
+        }
+        return { ok: true, path };
+      } catch (e) {
+        return { ok: false, reason: "error", message: errText(e) };
+      }
+    },
+
+    /**
+     * 改一个文件或文件夹的名字（3.0 刀 21）。**只换叶子，不搬地方。**
+     *
+     * ⚠️ **优先 `fileManager.renameFile`，因为只有它会更新链接。** 别的卡里写着
+     * `[[甲]]`，把 `甲.md` 改成 `乙.md` 之后那一处该跟着变成 `[[乙]]`——不做的
+     * 话链接当场断掉，而断掉的表现是「别的卡里冒出一张灰的、点进去什么都没有的
+     * 影子卡」（用户 09-24 报的就是这个，根因写在 adapter.js 那段）。
+     *
+     * 它还受用户设置里「文件与链接 → 自动更新内部链接」那一档管——那是他的选择，
+     * 不替他改。
+     *
+     * 退到 `vault.rename` 时**只搬文件、不动链接**，是降级不是等价。两个都没有
+     * 就回 `unsupported`，核心据此不显示按钮（同 trashFile 那条规矩）。
+     */
+    async renameFile(path, newName) {
+      // 去掉结尾斜杠：`a/b/` 和 `a/b` 是同一个东西，不去的话下面拼出来的
+      // 目标路径会多一段空段。
+      const from = toStr(path).replace(/\/+$/, "");
+      const leaf = toStr(newName).trim();
+      if (!from || !leaf) return { ok: false, reason: "error", message: "空路径或空名字" };
+      let target = null;
+      try {
+        target = app.vault.getAbstractFileByPath(from);
+      } catch (e) {
+        target = null;
+      }
+      if (!target) return { ok: false, reason: "missing", path: from };
+      // `children` 是宿主区分文件夹与文件的判据（与适配层别处同一条）。
+      // 文件要补回 `.md`——`newName` 按契约是**不含扩展名**的叶子名。
+      const isDir = target.children !== undefined;
+      const dir = from.split("/").slice(0, -1).join("/");
+      const to = (dir ? dir + "/" : "") + leaf + (isDir ? "" : ".md");
+      if (to === from) return { ok: true, path: from }; // 名字没变，什么都不用做
+      try {
+        if (app.vault.getAbstractFileByPath(to)) return { ok: false, reason: "exists", path: to };
+      } catch (e) {
+        /* 查不了就当没被占，交给下面那一步报 */
+      }
+      try {
+        const fm = app.fileManager;
+        if (fm && typeof fm.renameFile === "function") {
+          await fm.renameFile(target, to);
+        } else if (typeof app.vault.rename === "function") {
+          await app.vault.rename(target, to);
+        } else {
+          return { ok: false, reason: "unsupported", path: from };
+        }
+      } catch (e) {
+        return { ok: false, reason: "error", message: errText(e) };
+      }
+      // 回读**真正落到哪儿**：宿主可能因为重名把它改成了 `名字 1`。
+      // 同 createCard 那条纪律——核心不能假设写进去什么样就是什么样。
+      let landed = to;
+      try {
+        const after = app.vault.getAbstractFileByPath(to);
+        if (after && after.path) landed = after.path;
+      } catch (e) {
+        /* 读不回来就用我们拼的那个 */
+      }
+      return { ok: true, path: landed };
+    },
+
+    // 3.0 刀 35：读写一个**任意的小文本文件**（收纳方框的边车）。
+    //
+    // ⚠️ **两条都走 `app.vault.adapter`，不走 vault 那套。** 边车是点开头的名字
+    // （`.crystal-boxes.json`），而 Obsidian **不索引隐藏文件**：
+    // `getAbstractFileByPath` 找不到它、`vault.create` 也建不出来。
+    // 裸文件 API 走的是文件系统那一层，隐藏文件照样读写。
+    // 顺带的好处正是我们要的——宿主索引里没有它，**不会变成一张卡片**、
+    // 也不会出现在文件列表里。
+    async readTextFile(path) {
+      const p = toStr(path);
+      if (!p) return null;
+      // ⚠️ **"文件不在"和"读的时候出错"是两件事，不能都塌成 null。**
+      // 调用方拿 null 当"这一层还没有边车"，会**拿本地那份去覆盖写**——
+      // 于是"打开 vault 时文件还没同步下来"或"一次瞬时读失败"，
+      // 就足以把另一台机器摆好的框整份盖掉，而且是在对方那台机器上才显形。
+      // 所以：不在 → `null`；出错 → **抛**（调用方当"不知道"处理，什么都不动）。
+      let exists = false;
+      try {
+        exists = typeof app.vault.adapter.exists === "function" ? await app.vault.adapter.exists(p) : true;
+      } catch (e) {
+        throw e;
+      }
+      if (!exists) return null;
+      return await app.vault.adapter.read(p);
+    },
+
+    async writeTextFile(path, text) {
+      const p = toStr(path);
+      if (!p) return { ok: false, reason: "error", message: "空路径" };
+      const body = text == null ? "" : String(text);
+      try {
+        // 父目录不存在就先建。`adapter.write` 不会替你建目录。
+        const dir = p.split("/").slice(0, -1).join("/");
+        if (dir) {
+          try {
+            if (typeof app.vault.adapter.exists !== "function" || !(await app.vault.adapter.exists(dir))) {
+              await app.vault.adapter.mkdir(dir);
+            }
+          } catch (e) {
+            /* 已经存在 / 建不了都往下走，让 write 自己去报错 */
+          }
+        }
+        await app.vault.adapter.write(p, body);
+        return { ok: true, path: p };
+      } catch (e) {
+        return { ok: false, reason: "error", message: errText(e) };
+      }
+    },
+
+    async mountEditor(el, opts = {}) {
+      const path = toStr(opts.path);
+      const wantLine = Math.max(1, Math.round(Number(opts.line)) || 1);
+      if (!el || !path) return null;
+      let leaf = null;
+      let view = null;
+      let host = null;
+      let done = false;
+
+      const teardown = () => {
+        if (done) return;
+        done = true;
+        try {
+          if (host && host.parentNode) host.parentNode.removeChild(host);
+        } catch (e) {
+          /* 已经不在 DOM 里了 */
+        }
+        try {
+          if (view && typeof view.onunload === "function") view.onunload();
+        } catch (e) {
+          /* 半路搭起来的对象，生命周期方法不一定齐 */
+        }
+        try {
+          if (leaf && typeof leaf.detach === "function") leaf.detach();
+        } catch (e) {
+          /* 同上 */
+        }
+      };
+
+      /** 挂不上时的那一句：控制台一份，**界面上**一份（用户不开开发者工具也看得见）。 */
+      const fail = (why) => {
+        const msg = (why && why.message) || why || "原因未知";
+        try {
+          console.warn("[晶体库] 原生编辑器没挂上，已退回输入框：", msg);
+        } catch (err) {
+          /* 控制台都没有就算了 */
+        }
+        try {
+          const note = document.createElement("div");
+          note.className = "kb-v13-editor-note";
+          note.textContent = "宿主原生编辑器没挂上，已退回输入框：" + msg;
+          el.appendChild(note);
+        } catch (err) {
+          /* 连 DOM 都写不进去就算了 */
+        }
+        return null;
+      };
+
+      try {
+        const file = app.vault.getAbstractFileByPath(path);
+        if (!file) return fail("找不到这个文件");
+        // 构造函数只能从**活着的实例**上取。取不到就说明这个宿主不给这个口子。
+        //
+        // ⚠️ 3.0 刀 40（用户 09-29 真机抓到，1.3.81 修）：**这一段里绝对不能调
+        // `workspace.getLeaf(false)`。**
+        //
+        // 这里原来写的是 `const anyLeaf = app.workspace.getLeaf(false);`，注释还写着
+        // "false = 用现成的叶子，不新开一个"。**那句话是错的。** 宿主内部走的是
+        // `getUnpinnedLeaf()`——它的语义是"拿一颗**没被钉住**的叶子"，而当前活动的那颗
+        // 要是钉住的（或不可用），它**当场造一个新的空标签页**。
+        //
+        // 用户在阅读器里点 ✎ 时，活动叶子正是**晶体库自己那颗**，于是每点一次 ✎
+        // 就凭空多一个空白标签页——用户报的「无论什么卡片，点编辑都新增标签页」
+        // 就是这个。全屏/浮窗/嵌入三档都中，因为三档下活动叶子都是库自己那颗。
+        //
+        // 实证（用户真机 Console 探针，标签页被插进 DOM 那一刻的调用栈）：
+        //   mountEditor → t.getLeaf → t.getUnpinnedLeaf → t.setActiveLeaf
+        //   → t.selectTabIndex → t.updateTabDisplay → Element.insertBefore
+        //
+        // 而这个函数**只要那个类，根本不要那颗叶子**（下面 `new anyLeaf.constructor(app)`）。
+        // 所以从已经查到的 markdown 叶子上取构造器就够——`getLeavesOfType` 只是查表，
+        // 不激活、不新建，零副作用。
+        // ---- 3.0 刀 55：借编辑器类换成三条路，而且要**记着**（用户 10-02）----
+        //
+        // 用户报：「桌面的所有卡片，点编辑都报错」。真机探针一查：
+        // 他**一篇 Markdown 笔记都没开着**——18 个叶子全是侧栏 / 网页视图 /
+        // 插件自己的视图，`getLeavesOfType("markdown")` 回来是**空的**。
+        //
+        // 原来的判据要求「有一颗活着的 markdown 叶子，**而且**它 `view.editor` 还在」，
+        // 两条都得成立。可"必须开着一篇笔记"这个前提**从来没写出来过**；而他平时的
+        // 用法就是**不打开 .md 标签页**（都在晶体库里读），于是每一次点「编辑」都
+        // 掉进降级那条路，还附带一句给开发看的报错话。
+        //
+        // 现在依次试，**任何一条走通就不再往下**：
+        //   ① 活着的 markdown 实例（原路，判据放宽）
+        //   ② `app.viewRegistry.viewByType` 里那个造视图的函数——**不需要任何笔记开着**
+        //   ③ 上一次借成的那一份，本会话内一直有效
+        let ViewCtor = null;
+        let creator = null;
+        let anyLeaf = null;
+        for (const l of app.workspace.getLeavesOfType("markdown") || []) {
+          const v = l && l.view;
+          // ⚠️ 判据从「有 setState **且** 有 editor」放宽成「有 setState」。
+          //    多加 `&& v.editor` 那一条的唯一效果，是 Obsidian 哪天把 editor 改成
+          //    惰性的时候，**开着笔记也会判失败**——而那看起来跟"没开笔记"一模一样。
+          if (v && typeof v.setState === "function") {
+            ViewCtor = v.constructor;
+            anyLeaf = l; // 顺手留一颗**真**叶子，只为取它的类
+            break;
+          }
+        }
+        if (!ViewCtor) {
+          // ⚠️ 整条包在 try 里：`viewRegistry` 是**没有文档的内部结构**，
+          //    换个 Obsidian 版本可能整个不见。拿不到就往下走，**绝不抛**。
+          try {
+            const reg = app.viewRegistry && app.viewRegistry.viewByType;
+            const c = reg
+              ? typeof reg.get === "function"
+                ? reg.get("markdown")
+                : reg["markdown"]
+              : null;
+            if (typeof c === "function") creator = c;
+          } catch (e) {
+            /* 没有这个口子就没有 */
+          }
+        }
+        if (!ViewCtor && !creator && editorBorrow) {
+          creator = editorBorrow.creator || null;
+          ViewCtor = editorBorrow.ctor || null;
+        }
+        // 叶子类：**任何一颗活着的叶子都行**，只为借它的构造函数。
+        // 连一颗 markdown 叶子都没有时走这条：`iterateAllLeaves` 只遍历、不激活。
+        // ⚠️ 回调用**块体**、不交返回值：宿主的 iterate* 见到真值会提前停，
+        //    写成 `(l) => anyLeaf = l` 这种表达式体会在第一颗叶子就断掉。
+        if (!anyLeaf) {
+          try {
+            app.workspace.iterateAllLeaves((l) => {
+              if (!anyLeaf && l && l.constructor) anyLeaf = l;
+            });
+          } catch (e) {
+            /* 落到下面那句 fail */
+          }
+        }
+        if ((!ViewCtor && !creator) || !anyLeaf) {
+          // 这句是**给用户看的**，不是给开发看的：说清楚"为什么"和"下一步做什么"。
+          // 而且下面那个输入框**照样能写**，所以别把它写成"出错了"。
+          return fail(
+            "库里现在一篇 Markdown 笔记都没开着，借不到 Obsidian 的编辑器组件。" +
+              "随便打开一篇笔记，再点一次「编辑」就行——下面这个输入框照样能写。"
+          );
+        }
+
+        leaf = new anyLeaf.constructor(app);
+        view = creator ? creator(leaf) : new ViewCtor(leaf);
+        // 借成了就**记着**：本会话内不再依赖"有没有笔记开着"。
+        try {
+          editorBorrow = creator ? { creator } : { ctor: ViewCtor };
+        } catch (e) {
+          /* 记不住也不影响这一次 */
+        }
+        // View 的构造函数会建 containerEl，但我们不把它交给工作区——它只活在
+        // 我们这扇窗里，所以自己挂。脱离工作区的那几个生命周期方法也自己补上：
+        // 不补的话编辑器组件不会初始化（这是没有文档的那一段里最靠猜的一步）。
+        try {
+          leaf.view = view;
+        } catch (e) {
+          /* 只读就算了，下面的自检会说话 */
+        }
+        try {
+          if (typeof view.onload === "function") view.onload();
+        } catch (e) {
+          /* 同上 */
+        }
+        host = view.containerEl;
+        if (!host) return fail("宿主的视图没有 containerEl");
+        host.classList.add("kb-v13-native-editor");
+        el.appendChild(host);
+
+        // mode:"source" + source:false = **实时预览**那一档。这两个是宿主的内部
+        // 开关，不是「渲染/编辑两种视图」：mode:"preview" 是阅读视图，那个改不了字。
+        await view.setState({ file, mode: "source", source: false }, { history: false });
+        try {
+          if (typeof view.onOpen === "function") view.onOpen();
+        } catch (e) {
+          /* 同上 */
+        }
+
+        // 自检：等编辑器真的长出来。等不到就当没挂上——见函数开头那段。
+        const ok = await new Promise((resolve) => {
+          let tries = 0;
+          const tick = () => {
+            if (host.querySelector && host.querySelector(".cm-editor")) return resolve(true);
+            if (++tries > 40) return resolve(false); // 40 帧 ≈ 0.7 秒
+            (window.requestAnimationFrame || window.setTimeout)(tick);
+          };
+          tick();
+        });
+        if (!ok) return fail("宿主的视图挂上了，但编辑器没长出来（等不到 .cm-editor）");
+
+        const ed = view.editor;
+
+        /**
+         * 跳到第 n 行（1 基，**文件行号**）。返回真正落到的那个行号——
+         * 越界会被夹回文件范围内，把夹过的数交回去，界面上的输入框才能跟着纠正。
+         */
+        const gotoLine = (n) => {
+          try {
+            if (!ed) return wantLine;
+            const total = ed.lastLine() + 1;
+            const at = Math.max(1, Math.min(total, Math.round(Number(n)) || 1));
+            const pos = { line: at - 1, ch: 0 };
+            ed.setCursor(pos);
+            ed.scrollIntoView({ from: pos, to: pos }, true); // true = 尽量居中
+            ed.focus();
+            return at;
+          } catch (e) {
+            return wantLine;
+          }
+        };
+        // 出生就把光标和视口落到第 a 行——这就是「一扇窗 = 从第 a 行看起」在
+        // 绑文件这一版里的落点（用户 09-18 拍板的那条）。
+        gotoLine(wantLine);
+
+        return {
+          // ⚠️ **宿主自己会存盘**，核心据此不再走「带基线的写盘」那条路
+          // （宿主刚存过，基线必然过期）。见函数开头那一段。
+          selfSaving: true,
+          gotoLine,
+          getValue: () => {
+            try {
+              return toStr(ed ? ed.getValue() : "");
+            } catch (err) {
+              return "";
+            }
+          },
+          setValue: (v) => {
+            try {
+              if (ed) ed.setValue(toStr(v));
+            } catch (err) {
+              /* 编辑器正在合成输入时可能拒绝，忽略 */
+            }
+          },
+          focus: () => {
+            try {
+              if (ed) ed.focus();
+            } catch (err) {
+              /* 同上 */
+            }
+          },
+          destroy: teardown,
+        };
+      } catch (e) {
+        teardown();
+        return fail(e);
+      }
+    },
+
+    // split: true —— 在右侧新开一个分屏放源文件，晶体库所在的叶子不关。
+    // opts.line 是正文首行的 0 基行号（core/model.js 的 bodyStartLine），走 eState
+    // 让编辑器把光标和视口直接落到那一行，不停在 frontmatter 的 YAML 上；
+    // 0 / 缺省 = 笔记顶部，那就整个第二参都不传——传一个空的 eState 进去是拿
+    // 「宿主默认」换「我们猜的默认」，越界还会让 Obsidian 直接抛。
+    // 拿不到文件或叶子时退回整页跳转：宁可是老行为，也不能点了没反应。
+    async openNote(path, opts = {}) {
+      // ⚠️ 3.0 刀 39（用户 09-29 报的）：**split 的基准要自己挑，不能交给"当前活动的叶子"。**
+      //
+      // `app.workspace.getLeaf("split", "vertical")` 是从**当前活动的那颗叶子**
+      // 旁边裂一块。全屏档里活动叶子就是用户那篇笔记，一切正常；而**浮窗/嵌入档里
+      // 多了一颗属于插件自己的叶子**（全屏档那些层挂在 `document.body` 上，没这回事），
+      // 它可以是活动的那颗——于是裂出来的是**一颗空标签页旁边的一块**，
+      // 用户看到的就是「点编辑冒出一颗新标签页 / 直接读不出来」。
+      //
+      // 改法：**认一颗已有的 markdown 叶子当基准**，没有才退回老写法。
+      // ⚠️ 全屏档下这两条是**同一颗叶子**（最近用过的那颗就是用户那篇笔记），
+      //    所以这一改对现有一切逐字不变——和 `viewRect` 是同一个套路。
+      const file = app.vault.getAbstractFileByPath(path);
+      const at = opts.line > 0 ? { eState: { line: opts.line, ch: 0 } } : undefined;
+      const base = markdownLeaf();
+      if (opts.split) {
+        try {
+          const leaf = base
+            ? app.workspace.createLeafBySplit(base, "vertical", false)
+            : app.workspace.getLeaf("split", "vertical");
+          if (file && leaf) {
+            await leaf.openFile(file, at);
+            return;
+          }
+        } catch (e) {
+          // 落到下面的整页跳转
+        }
+      }
+      if (file && base) {
+        try {
+          await base.openFile(file, at);
+          return;
+        } catch (e) {
+          /* 落到下面的整页跳转 */
+        }
+      }
+      app.workspace.openLinkText(path, "", false);
+    },
+
+    // 3.0 刀 19：把网址交给系统浏览器。阅读器的外部标签页嵌不进来时走这条。
+    //
+    // ⚠️ **三条路依次试，而且都要试**：这条路的失败是**静默的**（点了什么都不发生），
+    // 而用户点这颗按钮时已经站在「网页嵌不进来」那一档了——再给他一个没反应，
+    // 这扇窗就彻底是死的。每一条都包在自己的 try 里，一条不通换下一条。
+    //
+    //   1. Electron 的 `shell.openExternal` —— 桌面端最直接的一条。用
+    //      `globalThis.require` 取（**不是裸 `require`**）：同一个文件也被
+    //      dataviewjs 形态打包，那边没有 CommonJS 的 `require`，裸写会让打包器
+    //      在解析阶段就报错——而这一条本来就该是「拿不到就算了」。
+    //   2. `window.open(url, "_blank")` —— 网页标准 API。Obsidian 桌面把外链
+    //      交给系统的 window-open handler，效果通常和上面一样。
+    //      这条**必须带 `_blank`**：不给的话同窗口导航会把整个 Obsidian 换掉。
+    openExternal(url) {
+      const u = String(url || "").trim();
+      // 只放行 http/https。`file:` / `javascript:` 这类交给宿主去开是危险的，
+      // 而这一条网址来自用户在输入框里敲的东西——不该有第二个解释。
+      if (!/^https?:\/\//i.test(u)) return false;
+      try {
+        const req = typeof globalThis !== "undefined" ? globalThis.require : null;
+        if (typeof req === "function") {
+          const shell = req("electron").shell;
+          if (shell && typeof shell.openExternal === "function") {
+            shell.openExternal(u);
+            return true;
+          }
+        }
+      } catch (e) {
+        /* 没有 electron（网页端）或者被隔离了，走下面那条 */
+      }
+      try {
+        const w = typeof window !== "undefined" ? window : null;
+        if (w && typeof w.open === "function") {
+          w.open(u, "_blank", "noopener,noreferrer");
+          return true;
+        }
+      } catch (e) {
+        /* 弹窗被拦，如实回 false */
+      }
+      return false;
+    },
+
+    // 写回一张卡。新全文由核心算好（core/frontmatter.js），这里只管三件事：
+    // 比对基线 → 写盘 → 回读。适配层不解析、不改写、不序列化 YAML。
+    async writeCard(path, content, opts = {}) {
+      let file;
+      try {
+        file = app.vault.getAbstractFileByPath(path);
+      } catch (e) {
+        return { ok: false, reason: "error", message: errText(e) };
+      }
+      if (!file) return { ok: false, reason: "missing" };
+
+      const base = opts.base;
+      try {
+        if (typeof app.vault.process === "function") {
+          // vault.process 把「读当前内容 → 我们返回新内容 → 写盘」压在一次原子操作里，
+          // 比对与写盘之间没有 await。别的设备（FNS 同步）在这一瞬插进来的窗口
+          // 因此被压到最小——**消不掉**，快照比对不是锁，只能让它越来越小。
+          let conflicted = false;
+          await app.vault.process(file, (cur) => {
+            if (base != null && cur !== base) {
+              conflicted = true;
+              return cur; // 原样返回 = 不写，别人的改动留着
+            }
+            return content;
+          });
+          if (conflicted) {
+            return { ok: false, reason: "conflict", content: await readText(path) };
+          }
+        } else {
+          // 老宿主没有 vault.process：只能先读后写，中间那个窗口更大。
+          // 行为一样，只是更窄的那类竞态挡不住。
+          const cur = await readText(path);
+          if (base != null && cur !== base) {
+            return { ok: false, reason: "conflict", content: cur };
+          }
+          await app.vault.modify(file, content);
+        }
+        // 回读真实结果：宿主可能规范化了行尾等，核心不能假设写进去什么样就是什么样
+        return { ok: true, content: await readText(path) };
+      } catch (e) {
+        // 绝不抛——对齐 loadViewState 那条「失败静默兜底」的既有风格，
+        // 也保证核心那边有个干净的结果去渲染错误界面。
+        return { ok: false, reason: "error", message: errText(e) };
+      }
+    },
+
+    // ---- 3.0 刀 6 文献阅读器 ----
+
+    /**
+     * 可读的文献：卡片目录下（含子文件夹）的 PDF / 图片 / markdown。
+     *
+     * 走 `getFiles()` 而不是 `getMarkdownFiles()`——后一个看不见 PDF 和图片，
+     * 而「阅读器看不见 PDF」正是这一刀要解决的那件事。
+     *
+     * **目录口径与 loadCards 完全一致**（都以 CARDS_FOLDER 为根）。留在适配层
+     * 而不是让核心去读 config.js，是与 loadCards 同一条纪律：路径这种宿主知识
+     * 只有一处，换宿主时不必去核心里找常量。
+     */
+    async listDocs() {
+      try {
+        const out = [];
+        for (const f of walkCardsFolder().files) {
+          const kind = DOC_KINDS[String(f.extension || "").toLowerCase()];
+          if (!kind) continue;
+          out.push({
+            path: f.path,
+            name: toStr(f.basename),
+            kind,
+            folder: toStr(f.parent && f.parent.path),
+          });
+        }
+        // **不排序**：排序与分组归核心。两个实现各自排一遍的话，迟早会出现
+        // 「原型里是这个顺序、Obsidian 里是另一个」，而那种差异没人会去查。
+        return out;
+      } catch (e) {
+        return []; // 契约：读不出一律回空数组，绝不抛
+      }
+    },
+
+    /**
+     * 读原始字节，给 pdf.js 用。
+     *
+     * **不走 `assetUrl` + `fetch`**：那是拿 `app://` 这类宿主私有协议去赌 CSP
+     * 放行，而这条链路上任何一处的失败都长一个样（「PDF 打不开」）。
+     * vault.readBinary 是显式的、零赌注的一条路，而且 .md 也走它——
+     * 阅读器那边用 TextDecoder 解码，不必为文本再加第十五个方法。
+     */
+    async readBinary(path) {
+      try {
+        const file = app.vault.getAbstractFileByPath(path);
+        if (!file) return null;
+        return await app.vault.readBinary(file);
+      } catch (e) {
+        return null; // 契约：读不出返回 null，绝不抛
+      }
+    },
+
+    /**
+     * 新建一张卡片。**不能复用 writeCard**——那个是 getAbstractFileByPath
+     * 找不到就回 missing，语义是「写一张已经存在的卡」，正好相反。
+     *
+     * 返回里的 `path` 是**宿主落地的那个路径**，不是我们拼的那个：Obsidian 在
+     * 重名时会自动改成 `名字 1.md`。核心拿回读的路径去建卡，才不会出现
+     * 「屏幕上说建了 A、盘上其实叫 A 1」。
+     */
+    async createCard(name, content, folder) {
+      const dir = String(folder || cardsFolder).replace(/\/+$/, "");
+      const path = dir + "/" + name + ".md";
+      try {
+        if (app.vault.getAbstractFileByPath(path)) {
+          return { ok: false, reason: "exists", path };
+        }
+        // 目标目录不在就建。`vault.create` 在父目录缺失时**抛异常**，而那句话
+        // 是文件系统口吻的，用户看不懂自己做错了什么。
+        if (!app.vault.getAbstractFileByPath(dir) && typeof app.vault.createFolder === "function") {
+          await app.vault.createFolder(dir);
+        }
+        const made = await app.vault.create(path, content);
+        const real = made && made.path ? made.path : path;
+        // 回读真实全文：宿主可能规范化了行尾。与 writeCard 同一条纪律——
+        // 核心不能假设写进去什么样就是什么样。
+        return { ok: true, path: real, content: await readText(real) };
+      } catch (e) {
+        return { ok: false, reason: "error", message: errText(e) };
+      }
+    },
+
+    loadViewState() {
+      try {
+        const raw = backing.get(viewKey);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : null;
+      } catch (e) {
+        return null;
+      }
+    },
+
+    saveViewState(state) {
+      backing.set(viewKey, JSON.stringify(state));
+    },
+
+    // #22 偏好。读写都不校验字段——形状由核心定、核心自己兜底，
+    // 适配层加一层校验只会让「加一个新偏好」变成要动两个地方。
+    loadPrefs() {
+      try {
+        const raw = backing.get(prefKey);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : null;
+      } catch (e) {
+        return null;
+      }
+    },
+
+    savePrefs(prefs) {
+      backing.set(prefKey, JSON.stringify(prefs));
+    },
+  };
+}
+
+/**
+ * 把 pdf.js 运行时那份文件读成源码全文。
+ *
+ * 走 `adapter.read` 而不是 `vault.read`：它是 vault 里的一个普通文件，不是一个
+ * 笔记——`vault.read` 吃的是 TFile 且会走 Obsidian 的缓存层，而这里要的就是
+ * 「把盘上那份字节原样拿出来」。读不到时退一步走 vault API，再不行才报错。
+ */
+async function readPdfRuntime() {
+  try {
+    return await app.vault.adapter.read(VAULT_PDF_RUNTIME_PATH);
+  } catch (e) {
+    try {
+      const f = app.vault.getAbstractFileByPath(VAULT_PDF_RUNTIME_PATH);
+      if (f) return await app.vault.read(f);
+    } catch (e2) {
+      /* 落到下面那句错误 */
+    }
+    throw new Error("读不到 " + VAULT_PDF_RUNTIME_PATH + "：" + errText(e));
+  }
+}
+
+export async function bootObsidian(dv, container) {
+  const adapter = createObsidianAdapter({ dv, app });
+  // PDF 渲染器在这里建、从 mount 参数递进去。**不进适配层契约**：契约的语义是
+  // 「宿主能力」，而「怎么把 PDF 画出来」是核心的实现选择——宿主只负责用
+  // readBinary 把字节递过来。往契约里加方法要动两个实现 + 契约 + seam.spec 的
+  // 标题，为了一个纯核心的渲染实现去污染接缝，方向是反的（同刀 5 的 storyLayout）。
+  //
+  // **懒加载**：这时候只是把「怎么取源码」交出去，2MB 要等用户真点开第一份 PDF
+  // 才读、才解析。不这么做的话，光是打开晶体库就要先扛 2MB 的解析。
+  return mount({
+    adapter,
+    container,
+    pdfRenderer: createLazyPdfRenderer(readPdfRuntime, typeof document === "undefined" ? null : document),
+  });
+}
+
+export { mount };

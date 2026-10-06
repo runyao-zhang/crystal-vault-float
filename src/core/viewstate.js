@@ -1,0 +1,575 @@
+// 视图状态（#10）：形状、默认值、以及「一份坏状态该被怎么对待」。
+//
+// 这是纯函数模块——不碰 localStorage、不碰 DOM。适配层只负责把字符串读进来、
+// 写出去；「认不认得出、哪些字段能用」全在这里判定。好处是换宿时时版本规则
+// 不必各写一遍，坏状态的行为也能单独测。
+//
+// 唯一的硬要求：**sanitizeViewState 绝不抛异常**。
+// 一份截断的 JSON、一个来自未来版本的状态、一堆缺胳膊少腿的字段，
+// 最差都只能退化成默认视角——绝不能把晶体库锁死在打不开的状态。
+
+import { toStr } from "./dom.js";
+// 3.0 刀 46：四个方向的**名册只有一份**（frontmatter.js），那边的字母表和它
+// 下标对齐。以前这里另抄了一份，靠注释写着"顺序要一致"——而错开一格的后果是
+// "线从别的边出去"，不报错。
+import { SIDE_NAMES } from "./frontmatter.js";
+
+export const VIEW_STATE_VERSION = 1;
+
+/**
+ * 相机的缩放上下限。超出这个范围画布不是看不清就是没有意义，直接夹回来。
+ *
+ * 下限从 0.2 降到 0.05（3.0 刀 2）：故事线一屏要摊开一颗晶体的全部卡片，
+ * 30 张横排就是 7800px 宽——`fit()` 需要 k ≈ 0.18，夹在 0.2 上就**装不下**，
+ * 而「一眼看全局」正是故事线存在的理由。
+ *
+ * 语义上「小到看不清」比「根本看不到」轻：看不清可以滚轮放大，装不下没有出路。
+ * 老的存档里不可能存在小于 0.2 的 k，所以**不用升版本号**。
+ */
+export const MIN_SCALE = 0.05;
+export const MAX_SCALE = 4;
+
+/** 模块方框的最小尺寸，和拖拽时的下限是同一个数。 */
+export const MIN_MODULE_W = 80;
+export const MIN_MODULE_H = 60;
+
+export function defaultViewState() {
+  return {
+    v: VIEW_STATE_VERSION,
+    camera: { x: 0, y: 0, k: 1 },
+    modules: [],
+    membership: {},
+    crystalPos: {},
+    // 3.0 刀 5：故事线里**手工连的线**。形状 {晶体key: [{from, to, fromSide, toSide}]}。
+    // 键是晶体（故事线是按晶体看的），值里两端都是**卡片路径**。
+    cardLinks: {},
+    // 3.0 刀 13：蓝线（双链）**接在卡片的哪一边**。同样按晶体分，
+    // 形状 {晶体key: [{from, to, fromSide, toSide}]}。
+    //
+    // 单开一张表、不塞进 cardLinks：那张表里每一条都是**用户亲手画的金线**
+    // （有向、带 bends、能框选能删），而这一张记的是**他自己写的 [[双链]]
+    // 在屏幕上的接法**——线是笔记里的，库只是记下"他当时从哪个连接点拖出来"。
+    // 混在一起的话，drawManualLines / hitManual / 拐点下标回写三处都要先分辨
+    // "这是哪种线"。
+    //
+    // ⚠️ from/to 存**字典序小的在前**（与 storyline.js 的 mergePairs 同一套），
+    // 所以查找时两个方向都要试——别只按存进去的顺序查。
+    linkSides: {},
+    // 3.0 刀 13：被右键藏掉入链出链的那几张卡（**卡片路径**，平的）。
+    // 平的就够：路径在全库唯一，而且一张卡只属于一颗晶体，
+    // 在哪扇窗里藏的，回到库的故事线就还藏着——不需要再拿晶体名当键。
+    hiddenLinks: [],
+    // 3.0 刀 23「收纳方框」：把几张卡收进一个可以命名、可以收起的框里。
+    //
+    // ⚠️ **这里只存手动建的框。** 「一个子晶体一个框」那些是**算出来的**
+    // （storyline.js 的 boxesOf）——落盘的话文件夹一改名它们就对不上，
+    // 而那种错法没有任何东西会报出来，正是这一版要修的那一类。名字要能改，
+    // 所以另开一张 `boxNames` 按 id 覆盖。
+    // 3.0 刀 33：**按晶体分层**。形状与 `cardLinks` / `imports` 一样
+    // —— `{ "<晶体路径>": [框, ...] }`。原来是个**扁平数组**，于是换一个
+    // 文件夹看，别的层画的框还在原地摆着（用户 09-28 报的第 1 条）。
+    boxes: {},
+    boxNames: {},
+    collapsedBoxes: [],
+    // 3.0 刀 31：从**别的晶体**引进来、摆在这一层上的卡。
+    // 形状与 `cardLinks` 一样：`{ "<晶体路径>": [卡片路径, ...] }`。
+    imports: {},
+    // 3.0 刀 34：**引进来的卡摆在本层的哪儿**。`{ "<晶体路径>": { "<卡片路径>": {x,y} } }`。
+    //
+    // 为什么不能塞进 `crystalPos`（那张扁平表）：`crystalPos` 是**一张卡在自己家
+    // 那一层**的位置，而「导入」是把别人的卡摆到**我这一层**来。两者共用一个键的话，
+    // 在 B 层拖动一张从 A 层引进来的卡，会**连带把它在 A 层的位置也改掉**——
+    // 用户回到 A 层会发现那张卡自己挪了地方，而且不报错。
+    // （现在坐标还要写进卡片的 frontmatter，不改的话会把 A 层的位置直接写坏。）
+    importPos: {},
+    openCrystal: null,
+    selectedCrystal: null,
+    selectedCard: null,
+    scrollOffset: 0,
+  };
+}
+
+function isObj(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+/** 有限数才认，其余一律退回 fallback（NaN / "12" / undefined 都不算数） */
+function num(v, fallback) {
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+
+function clamp(v, lo, hi) {
+  return Math.min(hi, Math.max(lo, v));
+}
+
+/** 可空字符串：非字符串 / 空串一律成 null，省得下游要同时判两种「没有」 */
+function nullableStr(v) {
+  const s = toStr(v);
+  return s ? s : null;
+}
+
+/** 相机消毒。**导出的**：结构窗那扇窗的存档里也有一台相机（3.0 刀 9-D），
+ *  它住在 prefs 而不是 viewstate，但「什么算一台合法的相机」只该有一份定义。 */
+export function sanitizeCamera(raw) {
+  const def = { x: 0, y: 0, k: 1 };
+  if (!isObj(raw)) return def;
+  return {
+    x: num(raw.x, 0),
+    y: num(raw.y, 0),
+    k: clamp(num(raw.k, 1), MIN_SCALE, MAX_SCALE),
+  };
+}
+
+function sanitizeModules(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const m of raw) {
+    if (!isObj(m)) continue;
+    const id = toStr(m.id);
+    if (!id || seen.has(id)) continue; // 没有 id 或 id 重复的框，留着只会让归属指向不明
+    seen.add(id);
+    out.push({
+      id,
+      name: toStr(m.name) || "未命名模块",
+      x: num(m.x, 0),
+      y: num(m.y, 0),
+      w: Math.max(MIN_MODULE_W, num(m.w, 240)),
+      h: Math.max(MIN_MODULE_H, num(m.h, 160)),
+      parent: nullableStr(m.parent),
+    });
+  }
+
+  // 父指针只准指向真实存在、且不是自己的模块；顺着父链能绕回来的（成环）也断掉。
+  // 这一步放在这里而不是等 #17 的拖拽校验，是因为坏状态也会走到这条路径——
+  // 一个成环的父子关系会让渲染无限递归，那正是「锁死」的一种。
+  for (const m of out) {
+    m.parent = resolveParent(m, seen, out);
+  }
+  return out;
+}
+
+function resolveParent(m, ids, all) {
+  if (!m.parent || m.parent === m.id || !ids.has(m.parent)) return null;
+  const byId = new Map(all.map((x) => [x.id, x]));
+  const walked = new Set([m.id]);
+  let cur = m.parent;
+  while (cur) {
+    if (walked.has(cur)) return null; // 成环 → 断开，退成顶层
+    walked.add(cur);
+    const node = byId.get(cur);
+    if (!node) return null;
+    cur = node.parent === cur.id ? null : node.parent;
+  }
+  return m.parent;
+}
+
+/** 归属表：值必须是存在的模块 id，否则这条归属作废（晶体回到散着） */
+function sanitizeMembership(raw, modules) {
+  if (!isObj(raw)) return {};
+  const ids = new Set(modules.map((m) => m.id));
+  const out = {};
+  for (const [key, val] of Object.entries(raw)) {
+    const id = toStr(val);
+    if (key && ids.has(id)) out[key] = id;
+  }
+  return out;
+}
+
+/**
+ * 手工连的线。**绝不抛**，逐条退化：任何一条坏了只丢那一条，不整份作废。
+ *
+ * 两端都必须是非空字符串、方向必须是四个之一；连到不存在的卡上不管——
+ * 那张卡可能是被删了，而删卡不该顺手把别的线也弄没。渲染时找不到对方
+ * 自然就不画（见 storyline.js），那是「安静少一根线」，不是「整屏崩掉」。
+ */
+// 3.0 刀 46：名册住在 frontmatter.js（那边管着存进文件的字母），别在这儿再抄一份。
+const SIDES = SIDE_NAMES;
+function sanitizeCardLinks(raw) {
+  if (!isObj(raw)) return {};
+  const out = {};
+  for (const [key, list] of Object.entries(raw)) {
+    if (!key || !Array.isArray(list)) continue;
+    const keep = [];
+    const seen = new Set();
+    for (const l of list) {
+      if (!isObj(l)) continue;
+      const from = toStr(l.from);
+      const to = toStr(l.to);
+      if (!from || !to || from === to) continue;
+      const fs = SIDES.indexOf(toStr(l.fromSide)) >= 0 ? toStr(l.fromSide) : "right";
+      const ts = SIDES.indexOf(toStr(l.toSide)) >= 0 ? toStr(l.toSide) : "left";
+      const sig = from + "\u0000" + to + "\u0000" + fs + "\u0000" + ts;
+      if (seen.has(sig)) continue; // 同一条线被点两次不该留两条
+      seen.add(sig);
+      // 拐点（用户双击加上去的）。**数量封顶到 8**：一来再多就不像流程图了、
+      // 屏幕上也没法看，二来这是从盘里读回来的**不可信输入**，没有上限的话
+      // 一个坏文件就能塞进十万个点，把每一帧的渲染拖死。
+      // 坏点**逐个丢掉**而不是整条线作废——丢一条线是用户看得见的损失，
+      // 丢一个点他再双击一下就有了。
+      const bends = [];
+      if (Array.isArray(l.bends)) {
+        for (const b of l.bends.slice(0, 8)) {
+          if (!isObj(b)) continue;
+          const bx = num(b.x, null);
+          const by = num(b.y, null);
+          if (bx === null || by === null) continue;
+          bends.push({ x: bx, y: by });
+        }
+      }
+      const one = { from, to, fromSide: fs, toSide: ts };
+      if (bends.length) one.bends = bends;
+      keep.push(one);
+    }
+    if (keep.length) out[key] = keep;
+  }
+  return out;
+}
+
+/**
+ * 蓝线的接法提示（3.0 刀 13）。**绝不抛**，逐条退化——但比 sanitizeCardLinks 严：
+ *
+ * 一端的方向认不出来就**整条丢掉**，而不是像金线那样补一个缺省方向。
+ * 两者坏掉的代价不一样：金线缺了方向还得画，随便挑一个总比不画强；
+ * 而这一张是**提示**——丢了就退成「没有提示」，渲染那边会按两张卡的左右关系
+ * 自动挑一条，那本来就是这个功能没做之前的样子。给一条提示补一个瞎猜的方向，
+ * 反而会把线接到用户从来没说过的地方去，而他没有任何办法看出那是猜的。
+ *
+ * 数量封顶是**渲染护栏**：sideHintMap 每一帧都要按这份数据建一次 Map，
+ * 一个坏文件塞进十万条，每一帧就建十万项。超出的丢掉后面的——那是用户最近
+ * 拖的，但总比界面卡死强（与 bends 封顶 8 同一个理由）。
+ */
+const MAX_LINK_SIDES = 2000;
+function sanitizeLinkSides(raw) {
+  if (!isObj(raw)) return {};
+  const out = {};
+  for (const [key, list] of Object.entries(raw)) {
+    if (!key || !Array.isArray(list)) continue;
+    const keep = [];
+    const seen = new Set();
+    for (const l of list) {
+      if (keep.length >= MAX_LINK_SIDES) break;
+      if (!isObj(l)) continue;
+      const from = toStr(l.from);
+      const to = toStr(l.to);
+      if (!from || !to || from === to) continue;
+      const fs = toStr(l.fromSide);
+      const ts = toStr(l.toSide);
+      if (SIDES.indexOf(fs) < 0 || SIDES.indexOf(ts) < 0) continue; // 缺一头就整条丢
+      // 同一对只留最先那条。**签名不带方向**：from/to 已经是字典序规范过的，
+      // 带上方向反而会把"同一对的两份矛盾提示"当成两条不同的线放进来。
+      if (seen.has(from + " " + to)) continue;
+      seen.add(from + " " + to);
+      keep.push({ from, to, fromSide: fs, toSide: ts });
+    }
+    if (keep.length) out[key] = keep;
+  }
+  return out;
+}
+
+/**
+ * 被藏起来的卡（3.0 刀 13）。**绝不抛**：非字符串、空串、重复一律丢。
+ *
+ * 不校验「这张卡还在不在」——那要问 model，而这里是个纯函数。
+ * 卡片被删之后留下一条悬空路径的代价是零：渲染时按路径查位置，查不到
+ * 本来也不会画（与 cardLinks 那条「连到不存在的卡上不管」同一口径）。
+ */
+const MAX_HIDDEN_LINKS = 2000;
+function sanitizeHiddenLinks(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const p of raw) {
+    if (out.length >= MAX_HIDDEN_LINKS) break;
+    // **只认字符串**，不用 toStr 转。别处转是因为那些格子装的是 id / 名字，
+    // 数字转成字符串无害；这一格装的是**卡片路径**，把 42 转成 "42" 会造出
+    // 一条永远匹配不上任何卡片的悬空项——看着像条数据，实际是垃圾。
+    if (typeof p !== "string" || !p || seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out;
+}
+
+/**
+ * 「收纳方框」（3.0 刀 23）：一组卡片 + 一个名字 + 收起与否。
+ *
+ * ⚠️ **只有手动建的框存在这里**；「一个子晶体一个框」那些是**算出来的**
+ * （见 storyline.js 的 boxesOf），不落盘——落盘的话文件夹一改名它们就对不上了，
+ * 而那种错法没有任何东西会报出来（正是这一版要修的那一类）。
+ *
+ * 逐条过滤，任一项坏了只丢那一条，**绝不抛**。同 `sanitizeHiddenLinks` 那条：
+ * 成员路径**只认字符串**，绝不 toStr——把 42 转成 "42" 会造出一条永远匹配不上
+ * 任何卡片的垃圾成员，看着像数据。
+ */
+const MAX_BOXES = 200;
+const MAX_BOX_MEMBERS = 2000;
+/** 一层最多引进来多少张卡。和 `MAX_BOX_MEMBERS` 一样是**不可信输入的上限**，
+ *  不是产品上的建议值——一个坏存档不该能把每一帧的渲染拖死。 */
+const MAX_IMPORTS = 500;
+/**
+ * 3.0 刀 33（用户 09-28 第 1 条）：**老存档里那个扁平数组的临时落脚点。**
+ *
+ * 老形状是 `boxes: [框, ...]`，一个字节的"这个框是哪一层的"都没有。丢了就是
+ * 用户画过的框**整批消失**——所以先原样收在这把哨兵键下面，等运行时那边
+ * **拿方框的成员卡反推出它属于哪颗晶体**，再分发出去（见 app.js 的
+ * `adoptLegacyBoxes`）。
+ *
+ * ⚠️ 层键是 `crystalPath.join(" ")`，里面不可能有 NUL（用的是排布缓存同一种
+ * 分隔符），所以这把键**永远撞不上一个真的层**，只会存在到认领那一刻为止。
+ */
+export const LEGACY_BOX_KEY = " legacy";
+
+/** 把一条框洗干净。**新旧两种形状共用**（老数组里的、新表里的）。 */
+function sanitizeOneBox(b, seenIds, out) {
+  if (!isObj(b)) return;
+  const id = typeof b.id === "string" ? b.id.trim() : "";
+  if (!id || seenIds.has(id)) return;
+  const paths = [];
+  const seenP = new Set();
+  for (const p of Array.isArray(b.paths) ? b.paths : []) {
+    if (paths.length >= MAX_BOX_MEMBERS) break;
+    if (typeof p !== "string" || !p || seenP.has(p)) continue;
+    seenP.add(p);
+    paths.push(p);
+  }
+  seenIds.add(id);
+  // ⚠️ `x` / `y` 是**空框的落脚点**（有成员时用不上，包围盒是算出来的）。
+  // 丢掉它的话，一个还没放卡的框重开之后会跳回默认位置。
+  const bx = num(b.x, null);
+  const by = num(b.y, null);
+  out.push({
+    id,
+    name: toStr(b.name).slice(0, 80),
+    paths,
+    x: bx === null ? 40 : bx,
+    y: by === null ? 40 : by,
+    // 手动框的大小是**用户自己定的**（拍板的 B），所以它和 x/y 一样必须活着。
+    w: num(b.w, 360),
+    h: num(b.h, 260),
+    // ⚠️ 3.0 刀 51：**这一条不加，下面那套「谁新听谁的」整个是死的。**
+    //    `sanitizeOneBox` 是**逐个字段重建**的（同 `normalizeCard` 那个老坑），
+    //    漏掉它 = 每次开库都把时间戳抹成 0，于是合并时永远判「文件更新」。
+    savedAt: num(b.savedAt, 0),
+  });
+}
+
+function sanitizeBoxes(raw) {
+  // ① **老形状**（扁平数组）：整批收进哨兵桶，等运行时认领。
+  if (Array.isArray(raw)) {
+    const out = [];
+    const seenIds = new Set();
+    for (const b of raw) {
+      if (out.length >= MAX_BOXES) break;
+      sanitizeOneBox(b, seenIds, out);
+    }
+    return out.length ? { [LEGACY_BOX_KEY]: out } : {};
+  }
+  // ② 新形状：两层表。**逐层过滤**——某一层坏掉不该把别的层一起冲掉
+  //    （同 `sanitizeViewState` 顶上那条「逐字段退化」的纪律）。
+  if (!isObj(raw)) return {};
+  const result = {};
+  // ⚠️ **`seenIds` 是跨层共用的一个。** 每一层各一个的话，同一份存档里
+  // 两条 id 相同的框（不同的层）会双双活下来——而 `boxNames` / `collapsedBoxes`
+  // 是**按 id 索引的两张全局表**（`storyboxes.js` 里"id 全局唯一"是写死的硬前提）：
+  // 于是改一个框的名字、收一个框，会连另一层那个"同号"的一起改。
+  // 按构造不可能出现这种存档，但那正是"不可信输入"的意思——由不得它。
+  const seenIds = new Set();
+  for (const [key, list] of Object.entries(raw)) {
+    if (!key || !Array.isArray(list)) continue;
+    const out = [];
+    for (const b of list) {
+      if (out.length >= MAX_BOXES) break;
+      sanitizeOneBox(b, seenIds, out);
+    }
+    if (out.length) result[key] = out;
+  }
+  return result;
+}
+
+/**
+ * 框的显示名覆盖：`id -> 名字`。
+ *
+ * 晶体框的 id 是**算出来的**（`c:<晶体 key>`），没法把名字存在框自己身上，
+ * 所以要单独一张表。手动框也走它——一张表比分两处简单。
+ */
+function sanitizeBoxNames(raw) {
+  if (!isObj(raw)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const id = toStr(k);
+    const name = toStr(v).slice(0, 80);
+    if (id && name) out[id] = name;
+  }
+  return out;
+}
+
+/** 收起来的框（只剩一条标题栏）。同 `sanitizeHiddenLinks` 那套过滤。 */
+function sanitizeCollapsedBoxes(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const p of raw) {
+    if (out.length >= MAX_BOXES) break;
+    if (typeof p !== "string" || !p || seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out;
+}
+
+/**
+ * 引进来的卡（3.0 刀 31）。形状与 `sanitizeCardLinks` 一样是**两层表**：
+ * 键是晶体路径、值是卡片路径数组。
+ *
+ * 逐条过滤而不是整表作废：一条坏路径不该把用户摆好的另外几层一起冲掉
+ * （同上面 `sanitizeViewState` 顶上那条「逐字段退化」的纪律）。
+ */
+function sanitizeImports(raw) {
+  if (!isObj(raw)) return {};
+  const out = {};
+  for (const [key, list] of Object.entries(raw)) {
+    if (!key || !Array.isArray(list)) continue;
+    const keep = [];
+    const seen = new Set();
+    for (const p of list) {
+      if (keep.length >= MAX_IMPORTS) break;
+      if (typeof p !== "string" || !p || seen.has(p)) continue;
+      seen.add(p);
+      keep.push(p);
+    }
+    // 空数组**不存**：它在功能上等于"这一层没引过卡"，存着只是让存档变胖。
+    if (keep.length) out[key] = keep;
+  }
+  return out;
+}
+
+/**
+ * 引进来的卡摆在本层的哪儿（3.0 刀 34）。**两层表**：层键 → 卡片路径 → 坐标。
+ *
+ * 逐条过滤，一个坏坐标只丢那一条（同 `sanitizeCrystalPos` 那条）。
+ */
+function sanitizeImportPos(raw) {
+  if (!isObj(raw)) return {};
+  const out = {};
+  for (const [key, map] of Object.entries(raw)) {
+    if (!key || !isObj(map)) continue;
+    const one = {};
+    let n = 0;
+    for (const [path, val] of Object.entries(map)) {
+      if (n >= MAX_IMPORTS) break;
+      if (!path || !isObj(val)) continue;
+      const x = num(val.x, null);
+      const y = num(val.y, null);
+      if (x === null || y === null) continue;
+      one[path] = { x, y };
+      n++;
+    }
+    if (n) out[key] = one;
+  }
+  return out;
+}
+
+function sanitizeCrystalPos(raw) {
+  if (!isObj(raw)) return {};
+  const out = {};
+  for (const [key, val] of Object.entries(raw)) {
+    if (!key || !isObj(val)) continue;
+    const x = num(val.x, null);
+    const y = num(val.y, null);
+    if (x === null || y === null) continue;
+    out[key] = { x, y };
+  }
+  return out;
+}
+
+/**
+ * 把「从宿主读回来的任意东西」变回一份可用的视图状态。
+ *
+ * 两档退化：
+ *   - **整体丢弃**：不是对象、版本号对不上（含来自未来版本的）→ 回默认视角。
+ *     版本对不上意味着字段含义可能已经变了，逐字段抢救反而会拼出一份四不像。
+ *   - **逐字段退化**：版本对得上但某个字段坏了 → 只有那个字段回默认，
+ *     其余照常。用户排好的画布不该因为一个坐标是 null 就全丢。
+ */
+export function sanitizeViewState(raw) {
+  const def = defaultViewState();
+  if (!isObj(raw)) return def;
+  if (raw.v !== VIEW_STATE_VERSION) return def;
+
+  const modules = sanitizeModules(raw.modules);
+  return {
+    v: VIEW_STATE_VERSION,
+    camera: sanitizeCamera(raw.camera),
+    modules,
+    membership: sanitizeMembership(raw.membership, modules),
+    crystalPos: sanitizeCrystalPos(raw.crystalPos),
+    cardLinks: sanitizeCardLinks(raw.cardLinks),
+    linkSides: sanitizeLinkSides(raw.linkSides),
+    hiddenLinks: sanitizeHiddenLinks(raw.hiddenLinks),
+    boxes: sanitizeBoxes(raw.boxes),
+    boxNames: sanitizeBoxNames(raw.boxNames),
+    collapsedBoxes: sanitizeCollapsedBoxes(raw.collapsedBoxes),
+    imports: sanitizeImports(raw.imports),
+    importPos: sanitizeImportPos(raw.importPos),
+    openCrystal: nullableStr(raw.openCrystal),
+    selectedCrystal: nullableStr(raw.selectedCrystal),
+    selectedCard: nullableStr(raw.selectedCard),
+    scrollOffset: Math.max(0, Math.floor(num(raw.scrollOffset, 0))),
+  };
+}
+
+/**
+ * 只清「屏幕」那四样，**保留布局**（3.0 刀 3）。
+ *
+ * 「忘掉上次看到哪儿」这颗按钮的文案从一开始就只承诺了这四样
+ * ——「清掉记住的那颗晶体、那一页和最后翻开的那张卡」，一个字都没提画布。
+ * 而实现走的是 `state.view = defaultViewState()`，等价于把用户摆好的画布、
+ * 相机位置一起写没了。**所以这是把实现修到和承诺一致，不是改需求。**
+ *
+ * 拆开之后，「恢复默认」（画布）和「忘掉」（屏幕）是两件事、两个按钮，
+ * 语义不再重叠——这也正是它们该有的样子。
+ */
+export function forgetScreen(view) {
+  const base = view && typeof view === "object" ? view : defaultViewState();
+  return {
+    ...base,
+    openCrystal: null,
+    selectedCrystal: null,
+    selectedCard: null,
+    scrollOffset: 0,
+  };
+}
+
+/** 从当前运行时状态里取出要落盘的那一份（ctx.state → 视图状态） */
+export function collectViewState(state) {
+  // ⚠️⚠️ 3.0 刀 52：**必须把草稿并进来**，和 `commitDraft` 用同一个式子。
+  //
+  // 原来这里只读 `state.view`。而在相机档（故事线 / 结构窗）里用户的改动
+  // **全在 `state.draft` 里**——`beginDraft` 那一刻开的那份。于是每一次
+  // `flushViewState()`（拖完框、拖完卡、建完框都会调）写下去的都是
+  // **那份还没并进草稿的旧 view**：
+  //
+  //   · 屏幕上一切正常（界面读的是 `draft || view`）；
+  //   · **边车**（`.crystal-boxes.json`）也正常——`boxfile.js` 的 `viewOf`
+  //     读的就是 `draft || view`；
+  //   · **只有视图状态是旧的**。
+  //
+  // 两条持久化路线读的不是同一个对象，于是必然分叉；而分叉**只在重开之后**
+  // 才显形（用户 10-01 的原话：「只要我不关 Obsidian，一切正常，
+  // 关了再打开，又变成这个 bug 了」）。
+  //
+  // 式子**逐字对齐 `commitDraft`**（`canvas.js`）：草稿只覆盖它自己带的那些
+  // 布局键，其余键原样从 view 带过来。哪天那边改了合并方式，这里要跟着改。
+  const base = state
+    ? { ...(state.view || defaultViewState()), ...(state.draft || {}) }
+    : defaultViewState();
+  return {
+    ...base,
+    v: VIEW_STATE_VERSION,
+    openCrystal: nullableStr(state && state.openCrystal),
+    selectedCrystal: nullableStr(state && state.selectedCrystal),
+    selectedCard: nullableStr(state && state.selectedCard),
+    scrollOffset: Math.max(0, Math.floor(num(state && state.scrollOffset, 0))),
+  };
+}

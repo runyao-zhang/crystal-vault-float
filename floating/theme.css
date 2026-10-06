@@ -1,0 +1,119 @@
+/* 悬浮伴侣的皮肤：把 Obsidian 的主题变量名**声明出来**，再加这条拖拽条的样式。
+ *
+ * ── 为什么必须有这个文件 ──
+ *
+ * 阅读器是照着宿主主题写的，每一个颜色都是 `var(--text-normal, 回退值)` 这种形状
+ * （core/styles.js 里有一整张对照表）。在 Obsidian 里那些变量由主题提供；
+ * 伴侣里**一个都不存在**，于是所有回退值同时生效——画面不至于崩，但那是
+ * "碰巧凑出来的"，不是设计出来的。这个文件把那件事变成显式的。
+ *
+ * ⚠️ 值全部取自 core/styles.js 里**项目自己那套回退值**，不是我临时发明的颜色。
+ *    改动要跟着那边走，否则伴侣和 Obsidian 会各是各的样子。
+ *
+ * ── 为什么是深色 ──
+ *
+ * 晶体库那一层是**自绘深色、不跟主题**的（那是既有的设计边界）。伴侣里
+ * 并排摆着「结构窗（自绘深色）」和「阅读器（跟主题）」两块，如果这里声明成浅色，
+ * 两者就会像在 Obsidian 里那样天然不一致。伴侣是一扇独立的窗，统一成深色
+ * 才是一套东西。**想改成跟随系统的话，改这一个文件就够了**——这正是把它
+ * 单独拎出来的意义。
+ */
+
+:root {
+  /* 底色 */
+  --background-primary: #0e1a29;
+  --background-secondary: #05080f;
+  --background-modifier-form-field: rgba(4, 10, 20, 0.75);
+  --background-modifier-hover: rgba(0, 90, 150, 0.25);
+  --background-modifier-border: rgba(255, 255, 255, 0.08);
+  --background-modifier-box-shadow: rgba(0, 0, 0, 0.45);
+  --background-modifier-error: rgba(120, 40, 40, 0.18);
+
+  /* 正文，由重到轻 */
+  --text-normal: rgba(190, 220, 250, 0.8);
+  --text-muted: rgba(160, 190, 220, 0.5);
+  --text-faint: rgba(150, 185, 215, 0.45);
+
+  /* 强调与语义色 */
+  --text-accent: rgba(0, 200, 255, 0.8);
+  --text-error: #f87171;
+  --text-success: rgba(120, 220, 160, 0.85);
+  --text-on-accent: rgba(230, 245, 255, 0.95);
+
+  /* 按钮 */
+  --interactive-normal: rgba(10, 22, 40, 0.7);
+  --interactive-hover: rgba(0, 90, 150, 0.35);
+  --interactive-accent: rgba(0, 90, 150, 0.55);
+  --interactive-accent-hover: rgba(0, 120, 190, 0.45);
+
+  /* Obsidian 里还有一批变量不在这张表上，但核心或它依赖的样式偶尔会摸到。
+     给个中性值，免得落到浏览器的初始值上去（那会是黑的/透明的）。 */
+  --font-interface: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --font-text: var(--font-interface);
+  --font-monospace: Consolas, "Courier New", monospace;
+  --radius-s: 4px;
+  --radius-m: 8px;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;              /* 拖拽条那一层不许把页面撑出滚动条 */
+  background: #0e1a29;           /* 与主进程的 backgroundColor 对齐，避免启动时白闪 */
+  color: var(--text-normal);
+  font: 14px/1.5 var(--font-interface);
+}
+
+/* ── 拖拽条 ────────────────────────────────────────────────
+ *
+ * `-webkit-app-region: drag` 是 Chromium 原生认的那个机制（spike 里验过：
+ * getComputedStyle 读出来就是 "drag"）。**条上每一个可点的东西都必须显式
+ * 标回 no-drag**，否则点它会变成拖窗。
+ *
+ * z-index 要**高于阅读器那一层**（`.kb-v13-reader` 是 10020），
+ * 否则条被盖住、整个窗口就没法拖了。
+ */
+#float-chrome {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 0 12px;
+  box-sizing: border-box;
+  background: #16233a;
+  border-bottom: 1px solid var(--background-modifier-border);
+  color: #8fa8c8;
+  font: 12px/30px var(--font-monospace);
+  z-index: 10100;
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+#float-chrome button,
+#float-chrome #float-status,
+#float-chrome #float-title {
+  -webkit-app-region: no-drag;
+}
+
+#float-title { color: #7fd7ff; font-weight: 700; letter-spacing: .4px; }
+#float-status { color: #e0a94a; }
+.float-spacer { flex: 1; }
+
+#float-chrome button {
+  font: 12px/1 var(--font-monospace);
+  background: var(--interactive-normal);
+  color: #c8d3e0;
+  border: 1px solid #2c3543;
+  border-radius: 6px;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+#float-chrome button:hover { border-color: #3d4a5c; color: #e6eef8; }
+#float-chrome button[aria-pressed="true"] {
+  background: var(--interactive-accent);
+  border-color: var(--text-accent);
+  color: var(--text-on-accent);
+}

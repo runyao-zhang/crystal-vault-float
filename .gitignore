@@ -1,0 +1,9 @@
+node_modules/
+
+# 构建产物不进仓库（与插件仓同一条规矩）。
+# 发布走 Release 附件：把安装包作为资产挂上去，源码留在仓里。
+dist/
+*.log
+
+# electron-builder 的中间产物
+dist/float-dist/

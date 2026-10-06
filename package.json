@@ -1,0 +1,23 @@
+{
+  "name": "crystal-vault-float-repo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CrystalFloat —— 晶体库的悬浮伴侣（独立程序）。这个仓是**由 ari-crystal 同步过来的**，别直接改：改那边，然后 npm run land:float。",
+  "comment_type": "⚠️ 不要加 \"type\": \"module\"。主进程与预加载都是 CJS（esbuild 打的 .cjs），显式扩展名已经把话说清楚了。",
+  "comment_sync": "⚠️ 这个仓里的 src/ 和 floating/ 都是**产物**——由 D:/projects/ari-crystal 的 scripts/land-float.mjs 同步过来。直接在这儿改会在下一次同步时被覆盖。",
+  "scripts": {
+    "build": "node scripts/build-float.mjs",
+    "pack": "node scripts/pack-float.mjs",
+    "dist": "npm run build && npm run pack"
+  },
+  "devDependencies": {
+    "electron": "44.5.1",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2"
+  },
+  "dependencies": {
+    "katex": "^0.16.25",
+    "marked": "^16.4.1",
+    "pdfjs-dist": "^6.3.289"
+  }
+}

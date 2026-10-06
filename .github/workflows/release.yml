@@ -1,0 +1,92 @@
+# 打一个 tag 就出一次发布。
+#
+# ⚠️ **tag 必须和 `floating/package.json` 里的 `version` 逐字一致。**
+#    那一个文件是版本的唯一真源——electron-builder 从它取名、这个 workflow 拿它校验。
+#    对不上的话，附件的文件名里是一个版本、tag 是另一个，用户装完发现版本号不对。
+#
+# 为什么跑在 **windows-latest** 上：electron-builder 打 Windows 安装包（NSIS）
+# 要调 Windows 自己的工具链。在 ubuntu 上交叉编译得额外装 wine，而那条路
+# 出了名的脆——为了省几分钟跑一个"偶尔红"的流水线不划算。
+#
+# 产物两份，逐个当附件传：
+#   CrystalFloat-<版本>-x64.exe            安装包（免管理员）
+#   CrystalFloat-portable-<版本>.exe       单文件自解压
+#
+# ⚠️ **这个仓里的 src/ 和 floating/ 是产物**，由 D:/projects/ari-crystal 的
+#    `land-float.mjs` 同步过来。别在 GitHub 网页上改它们，会被下一次同步覆盖。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          cache: npm
+
+      - name: Tag 必须和 floating/package.json 的 version 一致
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VER=$(node -p "require('./floating/package.json').version")
+          if [ "$TAG" != "$VER" ]; then
+            echo "tag 是 '$TAG'，而 floating/package.json 里写的是 '$VER' —— 必须逐字一致"
+            exit 1
+          fi
+          echo "tag 与版本一致：$TAG"
+
+      - run: npm ci
+
+      - name: 构建
+        run: npm run build
+
+      - name: 打包
+        run: npm run pack
+        env:
+          # 未签名。**明确地**不给 electron-builder 任何签名凭据，
+          # 免得它在 CI 上找不到证书时给出一个含糊的失败。
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: 收集产物
+        shell: bash
+        run: |
+          mkdir -p out
+          cp dist/float-dist/CrystalFloat-*-x64.exe out/ 2>/dev/null || true
+          cp dist/float-dist/CrystalFloat-portable-*.exe out/ 2>/dev/null || true
+          ls -la out/
+          test "$(ls out | wc -l)" -ge 2 || { echo "安装包没出来两个"; exit 1; }
+
+      # ---- 构建来源证明 ----
+      #
+      # 和插件那条同一个理由，但在这儿**更要紧**：安装包是 100MB 的二进制，
+      # 没有源码可读，用户唯一的保障就是"它确实是从这个仓、这次提交构建出来的"。
+      #
+      #     gh attestation verify CrystalFloat-1.0.0-x64.exe --repo runyao-zhang/crystal-vault-float
+      - name: 给安装包出来源证明
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "out/*.exe"
+
+      - name: 发布
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --title "CrystalFloat ${GITHUB_REF#refs/tags/}" \
+            --generate-notes \
+            out/*.exe

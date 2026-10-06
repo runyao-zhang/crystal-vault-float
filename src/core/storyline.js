@@ -1,0 +1,3313 @@
+// 3.0 刀 5：故事线的渲染层——把排布算法的结果画到画布上。
+//
+// 和画布模式的关系：**同一个世界层、同一台相机、同一套拖动**，换的只是
+// 「画什么」。根层画的是晶体，层内画的是卡片节点 + 连线。
+//
+// 与 canvas.js 的关系：**单向**（本文件 import 它的 layoutOf / worldPosOf）。
+// 相机与拖动的公共部分在 canvas.js / itemdrag.js 里，这里只负责「画什么」。
+
+import { EL, esc, svgEl, swallowNextClick } from "./dom.js";
+import { layoutOf, worldPosOf } from "./canvas.js";
+import { bindItemDrag } from "./itemdrag.js";
+import { runLayout, layeredLayout, NODE_W, NODE_H } from "./storylayout.js";
+// 3.0 刀 23「收纳方框」。整块逻辑在那个文件里，这里只开三个口子：
+// 渲染时算一次框、把它们画到卡片**后面**，画线时问一句「这条边是不是通进收起来的框」。
+import {
+  boxesOf,
+  // 3.0 刀 47：`memberIndexOf` 改叫 `membersOf`，并且**返回一串而不是一个**
+  // （金框变成嵌套的之后，一张卡同时住在它自己和每一层祖先的框里）。
+  // 判"要不要藏"必须问「有没有**任何**一个罩着它的框收着」——只问最里面那个的话，
+  // 收了 A、而 C 没被单独收，C 的卡就照样画在屏幕上，用户明明把 A 收起来了。
+  membersOf,
+  innermostCollapsed,
+  collapsedSet,
+  renderBoxes,
+  bindBoxHover,
+  toggleBox,
+  renameBox,
+  deleteBox,
+  setBoxRect,
+  // 3.0 刀 47（用户第 3 条）：金框是**容器**——里面的卡不许拖进别的金框，
+  // 蓝框不许移出它所在的那个金框。几何算法和夹取都在那边。
+  rectOf,
+  innermostCrystalBox,
+  clampInto,
+  // 3.0 刀 48：蓝框"住在哪个金框里"的判据——**看成员不看位置**（见那边）。
+  // 抽到 storyboxes.js 是为了能单独验：1.3.88 那版用位置判，用户一报就中。
+  //
+  // ⚠️ 1.3.90 起它**只给"蓝框不许移出金框"那条约束用了**。跟随那条换成了
+  //    `box.paths ∩ mb.paths ≠ ∅`（见 `followers` 那段）——那个判据是充要的。
+  //    原来还有个 `isUnderBox`（"G 是不是 home 的祖先"），随那条一起删了：
+  //    它服务的那个判据本身是错的，留着只会是下一个人踩进去的第二种规矩。
+  crystalHomeOf,
+  // 3.0 刀 50：**跨层**跟随——蓝框按层存，金框逐层都有，两者的层不是一回事。
+  manualBoxesUnder,
+  // 3.0 刀 30：归属判定整批走 `assignCards`——单张那条路已经并进去了
+  // （"批里只有一张"是它的特例）。原来那三个单张的入口
+  // （`boxOfPath` / `addCardToBox` / `removeCardFromBox`）已经删掉，
+  // 理由写在 storyboxes.js 那一段上：两套写 `paths` 的代码迟早漂成两种判据。
+  assignCards,
+} from "./storyboxes.js";
+// 3.0 刀 31「从别的晶体引一张卡进来」。表与落座都归它管；
+// 这里只负责**把引来的那张算进每一处几何里**——漏掉任何一处，
+// 表现都是「卡片画出来了，但拖不动 / 连不上 / 框不住」。
+import {
+  importsOf,
+  importedCards,
+  unimportCard,
+  afterImport,
+  importPosOf,
+  setImportPos,
+} from "./storyimports.js";
+// 3.0 刀 34：把卡片的坐标写进它自己的 frontmatter（用户 09-29 要的可移植）。
+import { gridToPixel, queueCardPos } from "./cardpos.js";
+// 3.0 刀 46：**连线接法也走同一条路**（用户 10-01：压缩发给别人之后线全变左右）。
+// 这一份管写盘，读在下面的 `sideHintMap`。
+import { setCardSide } from "./linksides.js";
+// 方向字母 ↔ 方位名（`t/r/b/l` ↔ top/right/bottom/left）。字母是 frontmatter
+// 里存的形态，方位名是画线用的。**两张表都由 `LINK_SIDES` 现推**（见下面那段），
+// 不手抄——手抄的话哪天加一个方向，就是"存进去的字母读回来变成另一个方向"。
+import { SIDE_NAMES, sideLetter, sideName } from "./frontmatter.js";
+// 3.0 刀 32「格点」。单位怎么算出来的、坐标以哪个角为准，全写在那份文件头上。
+// 3.0 刀 42（用户 09-30 第 3 条）：**方框又把格点接回来了。**
+// 刀 34 撤过一次（用户 09-29），这一刀按他 09-30 的话装回去——所以 `UNIT`
+// 重新需要了（晶体框没有自己的坐标，只能吸附位移，见那一段）。
+// `snapX` / `snapY` 仍然不 export：吸一个点只走 `snapPos`，少一处漏吸的机会。
+import { STEP_X, STEP_Y, UNIT, snapPos } from "./storygrid.js";
+// 3.0 刀 34/38/39：新建的东西落在**你正看着的地方**。
+// ⚠️ 用的是 `viewportPoint`（**带相机换算**，屏幕上的比例 → 世界坐标），
+// 不是 `ctx.viewRect()` 那几个数——那是**屏幕**矩形，当世界坐标用会落到
+// 一个和当前视口无关的地方。见 `placeNewCard` 里那段。
+import { viewportPoint } from "./storyspot.js";
+import { beginInlineRename } from "./inlinerename.js";
+
+/** 节点之间的连线留出的空档（从节点边缘切进去多少） */
+const EDGE_PAD = 10;
+
+// ============================================================
+// 算：一次算好，缓存住
+// ============================================================
+
+/**
+ * 每个晶体一份排布结果。键是卡片路径拼的串——晶体的 key 本身就是路径，
+ * 但层内看的是**子树**，所以把这一层的路径拼起来当键才唯一。
+ *
+ * 缓存的意义不只是省算力：换位置的实现可能是**异步的**（将来那个 LLM），
+ * 而 renderCrystals 是同步的。没有缓存的话每一帧渲染都要等一次网络，
+ * 屏幕会先空一下再跳出来。有缓存就是「先拿旧的画着，新的算完再换上去」。
+ */
+const cache = new Map();
+
+/** 这一层要展示的卡片：**整棵子树**，不是只有直属的 */
+function cardsUnder(ctx, path) {
+  const out = [];
+  const walk = (p) => {
+    for (const c of ctx.model.cardsAt(p)) out.push(c);
+    for (const k of ctx.model.keysAt(p)) walk(p.concat([k]));
+  };
+  walk(path);
+  return out;
+}
+
+/**
+ * 3.0 刀 31：这一屏**要画的全部卡** = 这个文件夹里递归拿到的 + 用户从别处引进来的。
+ *
+ * ⚠️ **排布算法只吃前者**（`layoutFor` 里调的仍然是 `cardsUnder`）。这不是疏忽：
+ * `edgesUnder` 里那条「按文件名连」的底链是**按数组相邻对**建的，中间插一张外来卡
+ * 等于凭空多出两根「01 → 外来户 → 02」的链，整屏的次序当场全乱。
+ * 外来卡的位置从 `crystalPos` 来——引进来的那一刻就写进去了（见 storyimports）。
+ *
+ * 这个函数是**唯一的入口**：渲染、画线、拖动、连线、判归属全走它。
+ * 哪一处漏了它，症状都是同一类「卡片画出来了，但拖不动 / 连不上 / 框不住」，
+ * 而且**不报错**。
+ */
+function viewCards(ctx, path) {
+  const base = cardsUnder(ctx, path);
+  const extra = importedCards(ctx, base, path);
+  return extra.length ? base.concat(extra) : base;
+}
+
+/**
+ * 3.0 刀 34：这张卡是**引进来摆在这一层**的吗（相对于它自己住的那一层）。
+ *
+ * 用来决定「它现在的这个位置该记到哪儿」，两件事都靠它：
+ *   · **记进 `importPos` 而不是 `crystalPos`**——记错格子，在 B 层拖一张从 A 层
+ *     引进来的卡，会连带把它在 A 层的位置也改掉；
+ *   · **不往它的文件里写坐标**——外来卡此刻的位置是"它在我这层被摆在哪儿"，
+ *     跟它自己那颗晶体里的位置是两回事，写进去就是把 A 层的位置写坏。
+ */
+/** 层链 → 层键。**只在这里拼**，和 boxfile.js 的 `keyOfChain` 同一口径。 */
+const keyOfChain = (chain) => (Array.isArray(chain) ? chain : []).join(" ");
+
+function isForeign(ctx, path) {
+  return importsOf(ctx).indexOf(String(path || "")) >= 0;
+}
+
+/**
+ * 取这一层的边。**只保留两端都在这组卡片里的边。**
+ *
+ * ⚠️ 关系图的键是 **title 不是 path**，同名卡（两个文件夹里都有「01-总览」）
+ * 会让边指错人。所以这里不直接用 relatedOf 的 title，而是顺着
+ * `cardByTitle` 拿回卡片、再拿它的 path 核对归属——对不上就丢掉。
+ */
+function edgesUnder(ctx, cards) {
+  // 3.0 刀 31：外来卡有哪些。**只用来拦幽灵**，见下面那段。
+  // 这里现读一次而不是让调用方传进来：`edgesUnder` 有四个调用点，
+  // 多一个参数就多四处可能忘了传的地方，而忘了传的表现是「右上角凭空多出一排
+  // ↗ 别的晶体的虚线框」——不报错，只是屏幕上多了一堆没人要的东西。
+  const imported = new Set(importsOf(ctx));
+  const byTitle = new Map();
+  for (const c of cards) if (!byTitle.has(c.title)) byTitle.set(c.title, c);
+  const have = new Set(cards.map((c) => c.path));
+  // ---- 1. 底：**文件名相邻对**（01→02→03→…）----
+  //
+  // 用户的原话是「按文件名连接」。它是**底**不是装饰：保证这一屏永远是一条
+  // 连贯的链，而不是「双链稀疏时只剩一两根线」——那正是「整个故事线只有一条线」。
+  //
+  // 排布那边**一行都不用改**：最长路径分层喂进去，出来的正好是文件名顺序
+  // （链上第 i 张的深度 = i）。所以「按文件名从左到右」和原来那套算法不冲突，
+  // 之前只是没把这条链喂进去。
+  const chain = [];
+  for (let i = 0; i + 1 < cards.length; i++) {
+    chain.push({ from: cards[i].path, to: cards[i + 1].path, reason: "" });
+  }
+
+  // ---- 2. 面：用户真正写的双链 ----
+  // 和底分开带出去，因为**画法不一样**（见 renderStorylineStage）。
+  // 混成一样的话「哪条是我写的」就看不出来了，而那正是这一屏最该说清的事。
+  const seen = new Set();
+  const links = [];
+  const ghosts = new Map();
+
+  for (const c of cards) {
+    for (const r of ctx.model.relatedOf(c)) {
+      const target = byTitle.get(r.title);
+      const toPath = target && have.has(target.path) ? target.path : null;
+      if (!toPath) {
+        // 3.0 刀 31：**外来卡不生成幽灵。**
+        //
+        // 幽灵的意思是「这颗晶体的结构在别处还有下文」（点了会带你跳过去）。
+        // 而引进来的那张卡**压根不属于这颗晶体**——它连出去的那些东西不是这一屏的
+        // 下文，是它自己那颗晶体的下文。给它也生一串幽灵，右上角会凭空多出一排
+        // ↗ 别的卡片的虚线框，而它们和用户此刻在摆的这张图毫无关系。
+        if (imported.has(c.path)) continue;
+        // 链到这一组之外去了。**不能静默丢掉**——丢一条就少一层依赖，
+        // 排出来的深度是错的、画面会骗人。记成幽灵节点（画成虚框、点了跳过去）。
+        if (r.title && r.title !== c.title) ghosts.set(r.title, r.reason || "");
+        continue;
+      }
+      const key = c.path + "\u0000" + toPath;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      links.push({ from: c.path, to: toPath, reason: r.reason || "" });
+    }
+  }
+  return { chain, links, ghosts };
+}
+
+function layoutFor(ctx, path) {
+  const key = path.join("\u0000");
+  if (cache.has(key)) return cache.get(key);
+  const cards = cardsUnder(ctx, path);
+  const { chain, links } = edgesUnder(ctx, cards);
+  const nodes = cards.map((c) => ({ id: c.path, name: c.title }));
+  // 定位用的边 = 文件名链 + 双链。链保证排列顺序，双链只可能让某张往后挪
+  // （最长路径取 max），挪不动链已经定好的次序。
+  const edges = chain.concat(links);
+  const result = layeredLayout(nodes, edges);
+  cache.set(key, result);
+
+  // 换位置的实现（将来接 LLM）。**异步跑、跑完再换上去**，不挡当前这一帧。
+  if (ctx.storyLayout) {
+    runLayout(ctx.storyLayout, nodes, edges, {}).then((better) => {
+      if (!better || !better.meta || !better.meta.custom) return;
+      cache.set(key, better);
+      if (ctx.refreshStoryline) ctx.refreshStoryline();
+    });
+  }
+  return result;
+}
+
+/**
+ * 3.0 刀 34：**新建的卡片落在你正看着的地方**（用户 09-29）。
+ *
+ * 用户原话：「新建卡片…不建在当前窗口的中央，而是建立在固定的地方，如果我的
+ * 视口远离那个固定位置，还要回去找」。新卡原来**根本没有位置**，于是落到
+ * `layoutFor` 自己的坐标系里（从原点起算的那一套）——视口推远之后，
+ * 新建的卡就在屏幕外。
+ *
+ * 什么时候放弃：
+ *   · **这张卡不在你正看着的那一层**——它排在哪一行由排布算法说了算，
+ *     用户到那一层才看得见它。硬给一个"别处的视口中心"是没有意义的坐标。
+ *   · 量不到视口（没进相机档 / 那一屏不在屏幕上）——那会儿"中央"不存在。
+ *
+ * @returns {boolean} 真的给它定了位置吗（宿主拿它决定要不要重画）
+ */
+export function placeNewCard(ctx, path) {
+  const card = ctx.model && ctx.model.byPath ? ctx.model.byPath.get(String(path || "")) : null;
+  if (!card || !card.crystal) return false;
+  // ⚠️ 判据是「**这张卡落在你正看着的那一层的子树里**」，不是"两条链完全相等"。
+  //
+  // 第一版写的是后者，于是**建在子文件夹里的卡永远摆不进来**——而它明明就画在
+  // 这一屏上（`cardsUnder` 是**递归**的）。用户 09-29 报的正是这个：
+  // 「新卡还是在默认位置，虽然能实时显示了，但不是我打开的这个结构窗的视口里」。
+  // 症状之所以是"默认位置"，是因为这里回 false 之后没人给它位置，它就落回
+  // `nodePosOf` 的下一层（卡片 frontmatter 或排布算法）。
+  //
+  // 看着的那一层是 `ctx.state.crystalPath`（一条链，如 `["Python","Python/数据分析"]`）。
+  const viewed = Array.isArray(ctx.state.crystalPath) ? ctx.state.crystalPath : [];
+  const chain = ctx.model.resolveChain ? ctx.model.resolveChain(card.crystal) : null;
+  if (!Array.isArray(chain) || chain.length < viewed.length) return false;
+  for (let i = 0; i < viewed.length; i++) if (viewed[i] !== chain[i]) return false;
+  // ---- 落点：按**当前视口**算（用户 09-29 定的公式）----
+  //
+  // 「根据当前视口，建立在**视口右侧 5%** 的位置」：
+  //   · 横向：贴右边，离视口右边缘留 5% 宽 —— 也就是卡片的**右边缘**落在
+  //     "右边留 5%" 那一点上（不是左边缘落在 95% 上：那样子卡会几乎全在屏幕外）；
+  //   · 纵向：**居中**（用户只说了横向）。
+  //
+  // ⚠️⚠️ **必须走 `viewportPoint`（它会用相机把"屏幕上的哪一点"换算成世界坐标），
+  // 不能直接拿 `ctx.viewRect()` 的数当世界坐标用。** 我第一版就是这么错的：
+  // `viewRect()` 给的是**这一层在屏幕上的矩形**（全屏时是 `0,0,窗口宽高`），
+  // 而 `crystalPos` 存的是**世界坐标**——两者只在"相机停在原点、缩放 1"时重合。
+  // 于是新卡永远落在一个**和用户推到哪儿毫无关系**的固定地方，
+  // 表现就是用户报的「还是默认坐标，不在我打开的这个视口里」。
+  // 用户把这句话说得很准：「当前视口是指**当前正在打开**的那个视口，
+  // 不是原始视口——原始视口是最初默认打开的位置」。
+  //
+  // ⚠️ 这里**不吸附到格点**（别处拖卡片是吸附的）。用户给的是一个**具体公式**，
+  //    对不上他会以为又没生效；而"离右边 5%"本来就多半不在格点上，硬吸会差半格。
+  //    他拖一下它自己就归位了。
+  const p = viewportPoint(ctx, 0.95, 0.5);
+  if (!p) return false;
+  const at = { x: p.x - NODE_W, y: p.y - NODE_H / 2 };
+  const l = layoutOf(ctx);
+  if (!l.crystalPos) l.crystalPos = {};
+  l.crystalPos[card.path] = at;
+  // 顺手把它也写进文件：新建的卡片第一次就带上坐标，换台电脑打开也在原地。
+  queueCardPos(ctx, card.path, at);
+  return true;
+}
+
+/** 丢掉某个晶体的排布缓存（卡片增删、关系变了之后要重算） */
+export function invalidateStoryline(ctx, path) {
+  if (path) cache.delete(path.join("\u0000"));
+  else cache.clear();
+  if (ctx.refreshStoryline) ctx.refreshStoryline();
+}
+
+// ============================================================
+// 画
+// ============================================================
+
+/**
+ * 一张卡此刻该在哪。四层，从上往下问：
+ *
+ *   1. **引进来的卡**的落点（`importPos`，按"我在这一层把它摆哪儿"记的）
+ *   2. **本地摆过的**（`crystalPos`，这台机器上拖过 / 按过方向键）
+ *   3. **文件里的坐标**（`card.pos`，卡片 frontmatter 那一份）
+ *   4. 排布算法算出来的
+ *
+ * ⚠️ 2 排在 3 前面是**有意的**：`crystalPos` 记的是"我在这台机器上把它放哪儿了"，
+ *    而 3 是"别人（或我上次）写进文件的"。本地的排布不该被一次同步悄悄推翻——
+ *    但**换一台机器打开时 `crystalPos` 是空的**，那里就落到 3 上，
+ *    这正是这一刀要的「别人电脑上相对位置一样」。
+ */
+export function nodePosOf(ctx, card, layout) {
+  const own = importPosOf(ctx, card.path);
+  if (own) return own;
+  const saved = layoutOf(ctx).crystalPos;
+  const p = saved && saved[card.path];
+  if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) return { x: p.x, y: p.y };
+  const fromFile = gridToPixel(card.pos);
+  if (fromFile) return fromFile;
+  return layout.positions.get(card.path) || { x: 0, y: 0 };
+}
+
+/** 幽灵节点摆在哪：主体**上面**一条带（它们不是这一层的卡，不占主图的位置） */
+function ghostTop() {
+  return -(NODE_H + 40);
+}
+
+/**
+ * 这一屏所有节点的世界包围盒——`fit()` 拿它框一下。
+ *
+ * **必须把幽灵节点算进去**：它们摆在 y 为负的一条带上，不算的话
+ * `fit()` 框出来的是主体那块，幽灵整条露在视口外面——而它们恰恰是
+ * 「这条线还有下文」的提示，看不到就等于没有。
+ */
+export function storylineBounds(ctx, path) {
+  // 3.0 刀 31：**外来卡要算进包围盒**。不算的话 `fit()` 框出来的是文件夹那一块，
+  // 而引进来的卡落在视口中心——于是"进来一张卡"这件事在屏幕上完全看不出来
+  // （它在框外面），而用户明明点过按钮。
+  const cards = viewCards(ctx, path);
+  const { ghosts } = edgesUnder(ctx, cards);
+  if (!cards.length && !ghosts.size) return null;
+  const layout = layoutFor(ctx, path);
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  const grow = (x, y) => {
+    x0 = Math.min(x0, x);
+    y0 = Math.min(y0, y);
+    x1 = Math.max(x1, x + NODE_W);
+    y1 = Math.max(y1, y + NODE_H);
+  };
+  for (const c of cards) {
+    const p = nodePosOf(ctx, c, layout);
+    grow(p.x, p.y);
+  }
+  [...ghosts.keys()].forEach((_, i) => grow(i * (NODE_W + 24), ghostTop()));
+  if (x0 === Infinity) return null;
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+function ensureLinkLayer(ctx) {
+  if (ctx._sLink && ctx._sLink.parentNode) return ctx._sLink;
+  const svg = svgEl("svg");
+  svg.setAttribute("class", "kb-v13-slinks");
+  ctx.canvas.appendChild(svg);
+  ctx._sLink = svg;
+  return svg;
+}
+
+/**
+ * 拐点抓手单独一层，**画在卡片之上**。
+ *
+ * 头一层 SVG 的 z-index 是 0、卡片节点是 1——线活在卡片底下（对的，线横穿卡面
+ * 会很难看）。但抓手不能也跟着埋在底下：金线经常整段压在别的卡上，
+ * 那样抓手就永远点不着，"拖拐点"这件事直接作废。所以抓手自己一层、z-index 2。
+ */
+function ensureHandleLayer(ctx) {
+  if (ctx._sHandle && ctx._sHandle.parentNode) return ctx._sHandle;
+  const svg = svgEl("svg");
+  svg.setAttribute("class", "kb-v13-shandles");
+  ctx.canvas.appendChild(svg);
+  ctx._sHandle = svg;
+  return svg;
+}
+
+/**
+ * 画这一层的故事线。
+ *
+ * 节点用的是**小形态**（标题 + 概念），不是卡阵里那种完整卡 DOM——
+ * 一屏要摊开几十上百张，完整卡那套（概念区、关键词条、标签）会把浏览器按死。
+ * 这是故事线最容易翻车的地方，所以形态从一开始就是小的。
+ */
+export function renderStorylineStage(ctx, path) {
+  // 3.0 刀 31：`base` 是文件夹里递归拿到的，`extra` 是从别处引进来的。
+  // **写成两个而不是直接 `viewCards`**，是因为下面那个节点循环要拿 `importSet`
+  // 给外来卡挂「✕ 拿走」那颗按钮——而"哪些是外来的"这件事只有这里知道。
+  const base = cardsUnder(ctx, path);
+  const extra = importedCards(ctx, base, path);
+  const cards = extra.length ? base.concat(extra) : base;
+  const importSet = new Set(extra.map((c) => c.path));
+  // 3.0 刀 34："我正在看的是哪一层"这件事，`placeNewCard` 直接读
+  // `ctx.state.crystalPath`（那本来就是权威，而且是**链**不是拼出来的字符串——
+  // 判子树关系要按段比，拼成字符串再切会栽在"文件夹名里有空格"上，
+  // 刀 35 的 `folderOfChain` 记过同一件事）。这里不再多存一份。
+  const { chain, links, ghosts } = edgesUnder(ctx, cards);
+  const layout = base.length ? layoutFor(ctx, path) : { positions: new Map() };
+  const pos = new Map();
+  for (const c of cards) pos.set(c.path, nodePosOf(ctx, c, layout));
+
+  // 3.0 刀 13：被右键藏掉入链出链的那几张卡。**这里也要算一份**——
+  // 线上那个跳过发生在 paintStoryLines 里，而节点上那个「线已藏」角标是在
+  // 下面这个循环里加的，两处各要一次。（漏掉这一个的后果是整屏渲染直接
+  // ReferenceError，连库都进不去——测试逮住了，别把它挪进 paintStoryLines。）
+  const hidden = hiddenCardSet(ctx);
+  // 3.0 刀 30：这一轮框选中的卡（卡档）。用 Set 是因为下面那个循环每帧都要问一次。
+  const picked = new Set(cardSel(ctx));
+
+  // 3.0 刀 23「收纳方框」（用户 09-27 第 2/3/4 条）。
+  //
+  // ⚠️ 顺序是硬的：**框先画**（DOM 在前 + CSS z-index 更低），卡片才压在它上面；
+  // 而成员表与收起表必须在这之前挂到 ctx 上——紧接着的 `paintStoryLines` 要靠
+  // 它们决定哪几根线不画。
+  const boxes = boxesOf(ctx, path);
+  ctx._boxMember = membersOf(boxes);
+  ctx._boxCollapsed = collapsedSet(boxes);
+  ctx._boxEls = renderBoxes(ctx.canvas, boxes, pos, EL, NODE_W, NODE_H);
+  // 悬停委托**只挂一次**：卡片每帧重建，逐张挂监听会漏、也会越堆越多
+  // （同 itemdrag.js 那条「事件绑舞台」的教训）。元素表每次渲染换新的，
+  // 所以监听里读的是 `ctx._boxEls` 而不是某个快照。
+  if (!ctx.canvas._kbBoxHover) {
+    ctx.canvas._kbBoxHover = true;
+    bindBoxHover(ctx.canvas, () => ctx._boxEls);
+  }
+  // 框上那两颗东西也**只挂一次**（同上面那条）。收起/展开、就地改名。
+  // ⚠️ 用**捕获**阶段拦下，并且拦完就停：框的标题栏压在舞台上，
+  // 而舞台自己也有点击处理（点空白退出编辑态那一条），不拦就会两件事一起发生。
+  if (!ctx.canvas._kbBoxClick) {
+    ctx.canvas._kbBoxClick = true;
+    ctx.canvas.addEventListener(
+      "click",
+      (e) => {
+        const t = e.target;
+        if (!t || !t.closest) return;
+        const tg = t.closest("[data-box-toggle]");
+        if (tg) {
+          e.stopPropagation();
+          e.preventDefault();
+          toggleBox(ctx, tg.getAttribute("data-box-toggle"));
+          return;
+        }
+        const dl = t.closest("[data-box-del]");
+        if (dl) {
+          e.stopPropagation();
+          e.preventDefault();
+          deleteBox(ctx, dl.getAttribute("data-box-del"));
+          return;
+        }
+        const nm = t.closest("[data-box-name]");
+        if (nm) {
+          e.stopPropagation();
+          e.preventDefault();
+          const id = nm.getAttribute("data-box-name");
+          // 复用库里的就地改名（方框那句话的同一套）：中文输入法合成中不接手、
+          // Esc 还原、失焦提交——这些坑那边都踩过了，别再造一个。
+          beginInlineRename(nm, nm.textContent, (name) => renameBox(ctx, id, name));
+          return;
+        }
+        // 3.0 刀 32 在这里挂过一条「点标题栏空白处 = 选中这个框」，
+        // 3.0 刀 34 随"框不走格点"一起撤掉了——框不再能被方向键挪，
+        // 那个选中态就只剩个亮着却按不动的高亮。
+      },
+      true
+    );
+  }
+
+  // 3.0 刀 25（用户 09-27 拍的 Q6=能）：**拖框 = 整组一起挪**。
+  //
+  // 3.0 刀 42（用户 09-30 第 1 条）：起手的地方从**只有标题栏**放宽成**框里任何
+  // 一块空白**。判据只有一句 `closest(".kb-v13-sbox")`——卡片是框的兄弟节点、
+  // 层级又更高，所以压在卡片上时指针根本落不到框上（见 styles.js 那条）。
+  //
+  // ⚠️ 拖动过程中**绝不能重画框**：那一块正拿着指针捕获，一换掉拖动当场断在半路
+  //    （同 `paintStoryLines` 顶上那条「绝不能在这里重建节点」）。所以框自己挪自己，
+  //    卡片走 `applyStorylinePositions`（**它只改 left/top，不动 DOM 结构**）。
+  if (!ctx.canvas._kbBoxDrag) {
+    ctx.canvas._kbBoxDrag = true;
+    ctx.canvas.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      const t = e.target;
+      if (!t || !t.closest) return;
+      // 标题栏上那几颗按钮不是拖动起点（同 desk.js 那条 `closest("button")` 的规矩）
+      if (t.closest("button")) return;
+      // 右下角那颗抓手**优先**：它不在标题栏上，不排前面就会被下面的
+      // 「拖动」当成一次整框拖动。
+      const gripEl = t.closest("[data-box-grip]");
+      if (gripEl) {
+        const gid = gripEl.getAttribute("data-box-grip");
+        const gnode = gripEl.closest(".kb-v13-sbox");
+        if (!gnode) return;
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          gnode.setPointerCapture(e.pointerId);
+        } catch (err) {
+          /* 合成事件拿不到捕获 */
+        }
+        const gw = parseFloat(gnode.style.width) || 360;
+        const gh = parseFloat(gnode.style.height) || 260;
+        const gx = e.clientX;
+        const gy = e.clientY;
+        let lw = gw;
+        let lh = gh;
+        // 3.0 刀 47（用户第 3 条）：**拉大也不能拉出金框**。
+        // 拖动那条路已经夹过了，缩放这条不夹的话，从右下角往外一扯就出去了
+        // ——而"框不许出金框"是对这个蓝框整体的约束，跟它是被拖出去的
+        // 还是被拉大的没有关系。
+        const gcp = ctx.state.crystalPath || [];
+        const gBoxes = boxesOf(ctx, gcp);
+        const gMe = gBoxes.find((b) => String(b.id) === String(gid));
+        const gPos = new Map();
+        for (const it of ctx._cardHit || []) gPos.set(it.path, { x: it.x, y: it.y });
+        const gClamp = (() => {
+          if (!gMe) return null;
+          const me = rectOf(gMe, gPos, NODE_W, NODE_H);
+          if (!me) return null;
+          const c0 = { x: me.x + me.w / 2, y: me.y + me.h / 2 };
+          for (let i = gBoxes.length - 1; i >= 0; i--) {
+            const b = gBoxes[i];
+            if (!b.crystal || b.collapsed) continue;
+            const r = rectOf(b, gPos, NODE_W, NODE_H);
+            if (!r) continue;
+            if (c0.x >= r.x && c0.x <= r.x + r.w && c0.y >= r.y && c0.y <= r.y + r.h) return r;
+          }
+          return null;
+        })();
+        // 3.0 刀 34：这里原来有一整套「宽高吸附到格点上」的算法，
+        // 用户 09-29 说收纳方框不要格点了，整套撤掉。下限回到
+        // storyboxes 的 MIN_BOX_W / MIN_BOX_H（260 / 180）——
+        // 拉不到更小，免得一个框被拉成一条线之后再也抓不住那颗抓手。
+        const rmove = (ev) => {
+          // ⚠️ 3.0 刀 34（用户 09-29）：**收纳方框不走格点**，大小也不用吸。
+          // 用户原话「把收纳方框的格点移动取消」——框是你画的自由容器，
+          // 卡片才是要对齐的东西。这里退回 1.3.56 的写法：只夹下限。
+          lw = Math.max(260, gw + (ev.clientX - gx));
+          lh = Math.max(180, gh + (ev.clientY - gy));
+          // 夹的是**右下角**：这个抓手在右下，所以它决定右下角能到哪儿。
+          // 左上角不动（框的位置是它自己记的 x/y，缩放不改位置）。
+          if (gClamp) {
+            const me = rectOf(gMe, gPos, NODE_W, NODE_H);
+            const maxW = gClamp.x + gClamp.w - me.x;
+            const maxH = gClamp.y + gClamp.h - me.y;
+            // ⚠️ 夹完还要**再夹一次下限**：金框比 260×180 还小的时候，
+            // 上面那两个 max 会小于下限，只夹上限就把框缩成负的宽高。
+            lw = Math.max(260, Math.min(lw, maxW));
+            lh = Math.max(180, Math.min(lh, maxH));
+          }
+          gnode.style.width = lw + "px";
+          gnode.style.height = lh + "px";
+        };
+        const rup = () => {
+          ctx.canvas.removeEventListener("pointermove", rmove);
+          try {
+            gnode.releasePointerCapture(e.pointerId);
+          } catch (err) {
+            /* 上面就没捕获成功过 */
+          }
+          setBoxRect(ctx, gid, { w: lw, h: lh });
+        };
+        ctx.canvas.addEventListener("pointermove", rmove);
+        ctx.canvas.addEventListener("pointerup", rup, { once: true });
+        ctx.canvas.addEventListener("pointercancel", rup, { once: true });
+        return;
+      }
+      // 3.0 刀 42（用户 09-30 第 1 条）：**整框都能起手**，不再只认标题栏。
+      // 那几颗按钮在上面已经排除了（`closest("button")` 与抓手各一条），
+      // 卡片够不到这儿（它是兄弟节点，层级还更高）。
+      const node = t.closest(".kb-v13-sbox");
+      const id = node && node.getAttribute("data-box");
+      if (!id) return;
+      const cp = ctx.state.crystalPath || [];
+      const box = boxesOf(ctx, cp).find((b) => String(b.id) === String(id));
+      // ⚠️ **空的手动框也要能拖。** 原来这里写的是 `!box.paths.length` 就直接
+      // return，理由是"没成员的框拖它干什么"——可框是用户**自己画**的那个东西
+      // （刀 27 拍板的 B），拖进来一张卡之前先把它摆到位，是最自然的一步。
+      // 晶体框不一样：它的位置是成员包围盒算出来的，没成员根本画不出来，
+      // 走不到这一行（这个 return 留着）。
+      if (!box || (!box.paths.length && box.crystal)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // ⚠️⚠️ 3.0 刀 44：**按下的这一下，绝不 setPointerCapture。**
+      //
+      // 这是 holodrag.js / panzoom.js 都栽过的同一个坑，而 panzoom 里那句原话
+      // 就是解药：「阈值之内不要指针捕获：按下就捕获会把 click 吃掉」。
+      // 在这里它更隐蔽——**`click` 的目标是「按下点」和「松开点」的最近公共祖先**，
+      // 而捕获会把 pointerup 的目标改写成被捕获的那个元素。于是「按在名字上、
+      // 原地松手」那一下：down 落在 span 上、up 落到整个方框上 → click 也落到
+      // 方框上 → `closest("[data-box-name]")` 查不到 → **改名当场哑掉**。
+      //
+      // 用户 09-30 报的就是这个，而且是「有没有卡都不行」。1.3.83 之前它只在
+      // **空框**上是好的：那会儿空框在下面那个守卫上就 return 了，压根没捕获，
+      // click 照旧落在名字上——**「空框能拖」和「点名字改名」当时共用同一个早退**，
+      // 刀 42 把那个早退放开，顺手把改名也赔了进去。
+      //
+      // 改法照抄 panzoom：**过了阈值才捕获**。没真拖的那一下，从头到尾什么都没发生。
+      let captured = false;
+      const grabPointer = () => {
+        if (captured) return;
+        captured = true;
+        try {
+          node.setPointerCapture(e.pointerId);
+        } catch (err) {
+          /* 合成事件拿不到捕获，退化成普通监听也能用 */
+        }
+      };
+
+      const layout = layoutFor(ctx, cp);
+      const now = new Map();
+      // 3.0 刀 31：外来卡也归框管——它进了框，拖框就该带着它一起走。
+      for (const c of viewCards(ctx, cp)) now.set(c.path, nodePosOf(ctx, c, layout));
+      const start = new Map();
+      for (const p of box.paths) start.set(p, { ...(now.get(p) || { x: 0, y: 0 }) });
+
+      // ⚠️ **屏幕位移必须换算成世界位移。** 卡片那条路走 `itemdrag`，它做的
+      // 就是这件事；这里第一版直接拿 `ev.clientX - sx`（屏幕像素）当世界坐标用，
+      // 于是相机只要不是 1:1，**框和卡片就会走不同的距离**——用户 09-27 报的
+      // 「鼠标拖相同距离，框比卡片走得短」正是这个。量两次相减，与卡片那条路对齐。
+      const toWorld = (x, y) => {
+        const pz = ctx._panzoom;
+        if (pz && typeof pz.clientToWorld === "function") {
+          try {
+            return pz.clientToWorld(x, y);
+          } catch (err) {
+            /* 拿不到就当 1:1，退化成旧行为，别让拖动整个哑掉 */
+          }
+        }
+        return { x, y };
+      };
+      const w0 = toWorld(e.clientX, e.clientY);
+      // 框**模型里**的位置（不是 DOM 的 left/top）——收起态那个条摆在重心上，
+      // 拿它当原点是错的，见 up 里那段。
+      const mx = Number(box.x);
+      const my = Number(box.y);
+      const bx = parseFloat(node.style.left) || 0;
+      const by = parseFloat(node.style.top) || 0;
+
+      // 3.0 刀 42（用户 09-30 第 3 条）：**两种方框都走格点。**
+      //
+      // 吸法不一样，因为它们的几何**来路**不一样（这是刀 23 就定下的分工）：
+      //   · **手动框**自己有记着的矩形 → 直接把 x/y 吸到格点上（`snapPos` 的判据
+      //     是**左下角**，和卡片同一把尺子）。框里每张卡再按**同一段位移**整体挪
+      //     ——相对位置一点不变，不会被挤到一起。
+      //   · **晶体框**的位置是成员包围盒**算出来**的，没有"框自己的坐标"可吸
+      //     → 退一步吸**位移**：取整成最小单位（21px）的整数倍。框和里面的卡
+      //     一起按整格走，同样是整体平移。
+      //
+      // ⚠️ 刀 34 撤过一次格点（用户 09-29 说「取消」），刀 42 又装回来了
+      //    （用户 09-30 说「采用格点移动」）。**别把其中任何一次当成笔误删掉**：
+      //    两次都是他明确要的，中间隔了一天。
+      const isManualBox = String(id).indexOf("m:") === 0;
+      const hasRect = isManualBox && Number.isFinite(mx) && Number.isFinite(my);
+
+      // 3.0 刀 47：两种框各自的"容器"关系（用户 10-01 第 3、4 条）。
+      //
+      // 第 3 条「蓝色收纳方框不可以移出金色方框之外」→ `blueClamp`。
+      // 第 4 条「拖动金框，里面所有元素跟随移动」→ `followers`：
+      //   卡片本来就跟着走（上面 `start` 是按 `paths` 拍的快照），漏的是
+      //   **蓝色收纳方框**——它是个自己记着矩形的容器，不带它走的话，
+      //   一拖金框，里面的卡全跑了、那个蓝框还钉在原地。
+      //
+      // 位置表用上面那份 `now`（就是这一帧屏幕上那些卡的位置），不重算。
+      //
+      // ⚠️ **1.3.89 修过一次，判据从"位置"换成"成员"。**
+      //
+      // 第一版问的是"蓝框的**中心**落不落在金框矩形里"。用户 10-01 报「拖金框，
+      // 蓝框没跟着走」——因为**蓝框是你手画的，常常比那个贴身的金框大**，
+      // 一边探出去之后**中心就跑到金框外面去了**，于是这一趟一个跟随者都找不到，
+      // 而且一声不响。
+      //
+      // 现在问的是**成员关系**：一个蓝框"住在"哪个金框里，看它收的那几张卡
+      // 是不是**全都在**那个金框的 `paths` 里（`paths` 是递归的，所以"全都在"
+      // 就等于"它是那颗文件夹（或它下面）的"）。这个判据**跟你怎么画无关**，
+      // 而且和归属判定（`hitBoxAt` / `assignCards`）天然一致。
+      const allBoxes = boxesOf(ctx, cp);
+      /** 兜底判据（只在蓝框**一个成员都没有**时用）：中心落在金框里吗。 */
+      const centreInside = (mb, r) => {
+        const mr = rectOf(mb, now, NODE_W, NODE_H);
+        if (!mr) return false;
+        const fx = mr.x + mr.w / 2;
+        const fy = mr.y + mr.h / 2;
+        return fx >= r.x && fx <= r.x + r.w && fy >= r.y && fy <= r.y + r.h;
+      };
+      const followers = [];
+      let blueClamp = null;
+      if (box.crystal) {
+        // **跟随判据：这张蓝框里有没有"这一趟真的会动的卡"。**
+        //
+        // 拖金框时动的卡**恰好**是 `box.paths`——上面那个 `start` 就是按它拍的
+        // 快照（`paths` 是递归的，而且**不含外来卡**；外来卡本来就不跟着金框走，
+        // 所以这里用同一个集合是**充要**的）。于是：
+        //   · 有交集 → 它有一部分卡在动 → 框必须跟，否则那部分卡当场跑到框外面；
+        //   · 没交集 → 它一张卡都没动 → 框**必须留在原地**。
+        //
+        // 这个判据**完全不看几何**——跟你把框画多大、画在哪、收没收起都无关。
+        //
+        // ⚠️⚠️ **1.3.89 用的是「我的全部成员是不是都在你里面」（`crystalHomeOf`），
+        //       那是错的，而且正好错在用户这一例上**：
+        //       一个蓝框**跨两个同级子文件夹**时，它的共同祖先就是**当前这一层**，
+        //       而当前这一层按用户拍板**不长金框** → 哪个框都装不下它 → 返回 null
+        //       → 退回"框中心落在金框矩形里吗"那条位置判据（1.3.88 的老路）
+        //       → 用户手画的框比金框大，中心落在外面 → **静默不跟**。
+        //       表现就是用户报的：「卡片移出蓝框好一段距离，框还留在原地」。
+        const moving = new Set(box.paths);
+        // ⚠️ **还要算上"存在更深那一层"的蓝框**（1.3.92）。
+        //
+        // 蓝框按层存，金框从 1.3.88 起逐层都有——于是"站在浅层拖某个深文件夹的
+        // 金框"这个动作，会带动那个文件夹里的卡，**却带不动那个文件夹里面画的
+        // 蓝框**（它存在更深那一层，不在这一屏的 `boxesOf` 里）。用户的报法就是
+        // 「拖完打开结构窗，卡片跑到框外面了」。
+        //
+        // 它们在这一屏上**不画**（属于别的层），所以没有 DOM——只跟着走、落盘。
+        const cross = [];
+        if (String(box.id).indexOf("c:") === 0) {
+          const here = keyOfChain(cp);
+          for (const e of manualBoxesUnder(ctx, String(box.id).slice(2), here)) {
+            const mine = Array.isArray(e.box.paths) ? e.box.paths : [];
+            if (!mine.some((p) => moving.has(p))) continue;
+            const mr = rectOf(e.box, now, NODE_W, NODE_H);
+            if (!mr) continue;
+            cross.push({ id: String(e.box.id), x: mr.x, y: mr.y, ox: mr.x, oy: mr.y, node: null });
+          }
+        }
+        for (const mb of allBoxes) {
+          if (mb.crystal) continue;
+          const mine = Array.isArray(mb.paths) ? mb.paths : [];
+          if (!mine.some((p) => moving.has(p))) continue;
+          const mr = rectOf(mb, now, NODE_W, NODE_H);
+          if (!mr) continue;
+          const el = (ctx._boxEls || new Map()).get(String(mb.id));
+          // ⚠️ 位移要从**它此刻真正的 DOM 原点**加起，不能从模型 x/y 加起。
+          //    收起态的框，那条标题栏摆在**重心**上而不是矩形左上角
+          //    （见 renderBoxes），拿模型 x/y 当原点的话，一拖金框，
+          //    里面收着的蓝框会当场跳到别处。**这一条也是"收起的框原来干脆不跟"
+          //    那个省略的代价**——现在它跟着走了，所以原点必须取对。
+          const ox = el ? parseFloat(el.style.left) : NaN;
+          const oy = el ? parseFloat(el.style.top) : NaN;
+          followers.push({
+            id: String(mb.id),
+            x: mr.x,
+            y: mr.y,
+            ox: Number.isFinite(ox) ? ox : mr.x,
+            oy: Number.isFinite(oy) ? oy : mr.y,
+            node: el,
+          });
+        }
+        // 跨层那几笔并进来（它们没有 DOM，`move` 里 `!f.node` 会跳过，
+        // 但 `up` 里照样落盘——那才是它们唯一要干的事）。
+        for (const f of cross) followers.push(f);
+      } else {
+        // 蓝框不许移出它所在的那个金框。判据仍然走**成员**（位置判据在这边一样会漏：
+        // 蓝框画大一点就不再"落在"金框里了，于是约束静默失效）。
+        //
+        // ⚠️ 跨文件夹的蓝框**故意不设限**：它确实不属于任何单独一个金框
+        //    （共同祖先正是当前这一层，不长金框）。硬塞一个约束反而让它拖不动。
+        const target = crystalHomeOf(allBoxes, box.paths);
+        if (target) blueClamp = rectOf(target, now, NODE_W, NODE_H);
+        else if (!(Array.isArray(box.paths) ? box.paths.length : 0)) {
+          // 空框没成员可问，退回位置判据。
+          for (let i = allBoxes.length - 1; i >= 0 && !blueClamp; i--) {
+            const b = allBoxes[i];
+            if (!b.crystal || b.collapsed) continue;
+            const r = rectOf(b, now, NODE_W, NODE_H);
+            if (r && centreInside(box, r)) blueClamp = r;
+          }
+        }
+      }
+      /** 把这一帧的原始位移吸成格点位移。 */
+      const snapDelta = (dx, dy) => {
+        // 没有自己的矩形（晶体框，或坐标坏掉的手动框）→ 只能吸位移。
+        // ⚠️ 坐标坏掉那一支不能顺手当成 0 去吸：`snapPos` 对非有限数是**回 0**，
+        //    于是 `0 - my` 会把框整个甩到世界的原点上，一下拖出屏幕。
+        if (!hasRect) {
+          return { x: Math.round(dx / UNIT) * UNIT, y: Math.round(dy / UNIT) * UNIT };
+        }
+        const to = snapPos(mx + dx, my + dy, Number(box.h) || 0);
+        return { x: to.x - mx, y: to.y - my };
+      };
+
+      let lastDx = 0;
+      let lastDy = 0;
+      const move = (ev) => {
+        // ⚠️ 3.0 刀 44：**过阈值才捕获**（见上面那段，这是改名能用的前提）。
+        // 阈值用**屏幕像素**，和 panzoom / itemdrag 同一把尺子——相机缩得很小时，
+        // "屏幕走了 10px"在世界里可能连一格都不到，拿世界坐标当阈值会变成
+        // "手感上拖不动"。
+        if (!captured) {
+          if (Math.abs(ev.clientX - e.clientX) < 4 && Math.abs(ev.clientY - e.clientY) < 4) return;
+          grabPointer();
+        }
+        const w1 = toWorld(ev.clientX, ev.clientY);
+        const dx = w1.x - w0.x;
+        const dy = w1.y - w0.y;
+        const raw = snapDelta(dx, dy);
+        // 3.0 刀 47（用户第 3 条）：蓝框不许移出它所在的那个金框。
+        // **夹在吸附之后**——反过来的话格点会把框从边界上又推出去一格，
+        // 表现是"还能蹭出去一点点"，而不是干净的"停在边界上"。
+        let sdx = raw.x;
+        let sdy = raw.y;
+        if (hasRect && blueClamp) {
+          const cl = clampInto(
+            blueClamp,
+            mx + sdx,
+            my + sdy,
+            Number(box.w) || 0,
+            Number(box.h) || 0
+          );
+          sdx = cl.x - mx;
+          sdy = cl.y - my;
+        }
+        lastDx = sdx;
+        lastDy = sdy;
+        // ⚠️ 3.0 刀 34：**一动没动就什么都不写。**
+        //
+        // 这条路没有 4px 阈值（它是 canvas 上的监听，不是 itemdrag），所以
+        // "按一下框、手指抖了 0px"也会走到这儿。原来它会照写一遍
+        // `crystalPos[p] = 原位`——把框里每张卡都标成"用户摆过"。
+        // 那在刀 34 之后是有后果的：迁移只搬"用户摆过"的卡，于是**一次点击
+        // 就能把排布算法算出来的位置固化进一堆文件的 frontmatter**。
+        //
+        // ⚠️ 判据是**吸完之后**的位移（刀 42 起）。半格以内的抖动吸完就是 0，
+        //    于是它连"抖了一下"都不算——这正是格点该有的样子：不到半格不动。
+        if (!sdx && !sdy) return;
+        // 卡片：晶体框和手动框都跟着走（用户 Q6 拍的是「框和里面的卡一起挪」）
+        const l = layoutOf(ctx);
+        if (!l.crystalPos) l.crystalPos = {};
+        for (const [p, s] of start) {
+          const to = { x: s.x + sdx, y: s.y + sdy };
+          // ⚠️ 3.0 刀 34：**外来卡的落点记在 `importPos`**，一样是为了不把
+          // 它在老家那一层的位置连带改掉（见 `isForeign`）。整框拖动时
+          // 框里混着外来卡是很常见的（那正是「导入」的用法）。
+          if (isForeign(ctx, p)) setImportPos(ctx, p, to);
+          else l.crystalPos[p] = to;
+        }
+        // ⚠️ DOM 写的是 **DOM 的位置 + 位移**，不是模型的位置。
+        // 收起态的条摆在重心上（见 renderBoxes），拿模型的 x/y 当原点的话，
+        // 框会在按下的那一瞬间跳到一个完全不同的地方——用户 09-27 报的就是这个。
+        node.style.left = bx + sdx + "px";
+        node.style.top = by + sdy + "px";
+        // 3.0 刀 47（用户第 4 条）：跟着走的蓝色收纳方框。**这里只改 DOM**
+        // （和这个框自己一样），落盘在 `up` 里——拖动过程中每帧写一次状态没有意义。
+        for (const f of followers) {
+          if (!f.node) continue;
+          f.node.style.left = f.ox + sdx + "px";
+          f.node.style.top = f.oy + sdy + "px";
+        }
+        applyStorylinePositions(ctx, cp);
+        redrawStoryLines(ctx);
+      };
+      const up = () => {
+        ctx.canvas.removeEventListener("pointermove", move);
+        try {
+          node.releasePointerCapture(e.pointerId);
+        } catch (err) {
+          /* 上面就没捕获成功过 */
+        }
+        // 手动框的**位置是它自己记的**（用户拍板的 B：框是你画的），得写回去——
+        // 不写的话，重开一次它就跳回建框时的位置。晶体框不用：它的位置是算出来的。
+        // ⚠️ 写回的是 **模型里的 x/y + 位移**，不是 DOM 的 `left/top` + 位移。
+        // 收起态的条摆在**重心**上，拿它当原点的话：框的矩形会跳到一个完全不同的
+        // 位置，而卡片只挪了 delta——**展开一看，卡片全跑到框外面**。
+        // 用户 09-27 报的就是这个。
+        //
+        // 3.0 刀 42：判据换成 `hasRect`（= 手动框 **且** 坐标是有限数）。
+        // 刀 42 起 `lastDx/lastDy` 是**吸过格点**的位移，所以写回去的
+        // `mx + lastDx` 正好就是那个格点坐标——和拖动时看到的框是同一个数。
+        if (hasRect && (lastDx || lastDy)) {
+          setBoxRect(ctx, id, { x: mx + lastDx, y: my + lastDy });
+        }
+        // 3.0 刀 34：整框拖完，**把里面那几张原生卡的新坐标落进它们的 frontmatter**。
+        // 拖动过程中不记（每一帧都记的话得写几百次），松手记一次就够——
+        // 防抖那边还要再等一小会儿才真写盘。
+        // 外来卡不用（它们的落点在 `importPos`，见上面那段）。
+        if (lastDx || lastDy) {
+          for (const [p, s] of start) {
+            if (isForeign(ctx, p)) continue;
+            queueCardPos(ctx, p, { x: s.x + lastDx, y: s.y + lastDy });
+          }
+          // 3.0 刀 47（用户第 4 条）：跟着走的蓝色收纳方框也要**落盘**。
+          // 只在 `move` 里改 DOM 的话，那一趟看起来完全正常，重开一次
+          // 蓝框就跳回原处、而里面的卡是搬过的——**同一段位移，卡写了框没写**，
+          // 正是这个仓里反复出现过的"两个半张脸对不上"。
+          for (const f of followers) {
+            setBoxRect(ctx, f.id, { x: f.x + lastDx, y: f.y + lastDy });
+          }
+        }
+        // 落定：立刻写盘，并让顶栏那个「未保存」小点跟上（同 itemdrag 的 end 那条）
+        if (ctx.flushViewState) ctx.flushViewState();
+        if (ctx.refreshStageUi) ctx.refreshStageUi();
+      };
+      ctx.canvas.addEventListener("pointermove", move);
+      ctx.canvas.addEventListener("pointerup", up, { once: true });
+      ctx.canvas.addEventListener("pointercancel", up, { once: true });
+    });
+  }
+
+  // 3.0 刀 31：外来卡上那颗「✕ 拿走」，委托一次（节点每帧重建，逐张挂会漏）。
+  //
+  // ⚠️ **绑舞台、用捕获**，两样都是硬的：
+  //   · 绑 `ctx.canvas` 不行——`bindLinkGuard` 也是 canvas 上的捕获监听，
+  //     而它**注册得更早**（mount 时），同元素同阶段按注册顺序跑，它会先把
+  //     这一下 `stopImmediatePropagation` 掉。舞台是 canvas 的祖先，
+  //     捕获阶段天然更早，稳。
+  //   · 不用捕获不行——冒泡回到舞台上时，那颗按钮早已被上面的守卫吃掉了。
+  if (!ctx.stage._kbUnimport) {
+    ctx.stage._kbUnimport = true;
+    ctx.stage.addEventListener(
+      "click",
+      (e) => {
+        const t = e.target;
+        const btn = t && t.closest ? t.closest("[data-unimport]") : null;
+        if (!btn) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (unimportCard(ctx, btn.getAttribute("data-unimport"))) afterImport(ctx);
+      },
+      true
+    );
+  }
+
+  const svg = ensureLinkLayer(ctx);
+  paintStoryLines(ctx, svg, cards, path, layout);
+
+  // 3.0 刀 30：框选卡片的命中几何。**和 `_manualHit` / `_blueHit` 一样是画的时候
+  // 顺手留下的**——卡片住在世界层里，`_cardHit` 是唯一能按世界坐标问"这个框扫到
+  // 哪些卡"的地方（同那两份注释）。
+  //
+  // ⚠️ **这里必须清空重来**，而且要在循环**外面**：`cards` 为空时循环一次都不跑，
+  // 放在里面的话上一轮那份几何会原地留着，屏幕上明明没有卡，框选却还能选中它们。
+  ctx._cardHit = [];
+
+  for (const c of cards) {
+    // 收起来的框里的卡**不画**（用户第 4 条）。只是不画——数据一个字没动，
+    // 框一展开原样回来。
+    // ⚠️ 1.3.88 起 `_boxMember` 是**一串**：一张卡同时住在它自己和每一层祖先的框里，
+    // 其中**任何一个**收着它就不该画。只问最里面那个的话，"收了 A 却没单独收 C"
+    // 会让 C 的卡留在屏幕上——用户明明把 A 收起来了。
+    const bids = ctx._boxMember.get(c.path);
+    if (bids && bids.some((id) => ctx._boxCollapsed.has(id))) continue;
+    const p = pos.get(c.path);
+    // ⚠️ 这一句要**排在上面那个 continue 之后**：收起来的框里的卡没画，
+    // 也就不该能被框选中——否则用户框一下会把一批看不见的卡也拖走。
+    ctx._cardHit.push({ path: c.path, x: p.x, y: p.y, w: NODE_W, h: NODE_H });
+    const el = EL("div", "kb-v13-snode");
+    el.dataset.path = c.path;
+    el.dataset.title = c.title;
+    // 3.0 刀 23：外面这张卡有蓝线连进某个收起来的框 → 点一个黄点（CSS 的 ::after）。
+    // 这是「线没丢，在那里面」的唯一线索：悬停这张卡，那几个框会绕边闪一圈。
+    const linked = ctx._boxLinked ? ctx._boxLinked.get(c.path) : null;
+    if (linked && linked.size) {
+      el.classList.add("kb-v13-snode-boxlink");
+      el.dataset.boxes = Array.from(linked).join(" ");
+    }
+    // 3.0 刀 13：这张卡的入链出链被右键藏起来了。
+    // **这不是装饰**——不标出来的话，用户看到的是一张一根线都没有、可他明明
+    // 写了双链的卡，那读起来是「我的双链丢了」，不是「我把它藏了」。
+    // 顺带也告诉他"再右键一次能显回来"这件事有地方可试。
+    if (hidden.has(c.path)) el.classList.add("kb-v13-snode-hidden");
+    // 3.0 刀 31：这是**从别的晶体引进来的**那张卡。标出来是必须的——
+    // 它看起来和这一屏的卡一模一样，而"这张不是我文件夹里的"正是用户
+    // 唯一需要知道的事（他可能正奇怪这张卡怎么在这儿、以及怎么弄走它）。
+    const isImport = importSet.has(c.path);
+    if (isImport) {
+      el.classList.add("kb-v13-snode-import");
+      el.title = "这是从别的晶体引进来的卡。它本身还在原来那个文件夹里，一个字没动。";
+    }
+    // 3.0 刀 30：这张卡在这一轮框选里被选中了（卡档）。**重建之后也得补上**——
+    // 高亮只在框选过程中刷是不够的：拖动整批时会重画，选中标记跟着一起没了。
+    if (picked.has(c.path)) el.classList.add("kb-v13-snode-picked");
+    el.style.left = p.x + "px";
+    el.style.top = p.y + "px";
+    el.style.width = NODE_W + "px";
+    el.style.height = NODE_H + "px";
+    el.innerHTML =
+      '<div class="kb-v13-snode-title">' + esc(c.title) + "</div>" +
+      '<div class="kb-v13-snode-concept">' + esc(c.concept || "") + "</div>" +
+      // 四边中点的连接点。平时藏着（CSS 里 .kb-v13-linking 才让它们显形）——
+      // 一屏几十张卡、每张挂四个小圆点，那画面没法看。
+      LINK_SIDES.map((sd) => '<div class="kb-v13-port" data-side="' + sd + '"></div>').join("");
+    // 「拿走」那颗。**挂在节点上而不是靠右键**：右键在这张图上已经有三个意思了
+    // （看模式进连接模式、写模式藏双链、落在线上进连线编辑），再塞第四个
+    // 就是 09-20「右键只有金色线」那类"点了之后发生什么全看运气"。
+    //
+    // 用 `innerHTML` 之后 append（不能用 innerHTML 拼进去）：`esc(c.path)` 那条
+    // 纪律只对文本内容成立，路径要进的是**属性**，走 DOM API 才不会漏转义。
+    if (isImport) {
+      const kill = EL("button", "kb-v13-snode-unimport", "✕");
+      kill.type = "button";
+      kill.setAttribute("data-unimport", c.path);
+      kill.title = "把这张卡从这一屏拿走。\n它本身一个字都不动——还留在原来那个文件夹里，";
+      kill.title += "别人指向它的双链也都在。想再放回来，点顶栏「导入卡片」再引一次。";
+      el.appendChild(kill);
+    }
+    ctx.canvas.appendChild(el);
+  }
+
+  // 幽灵节点：链到这一组之外去了的那一头。**不静默丢掉**——
+  // 丢一条边就少一层依赖，排出来的深度是错的、画面会骗人。
+  let gx = 0;
+  for (const [title, reason] of ghosts) {
+    const el = EL("div", "kb-v13-snode kb-v13-snode-ghost");
+    el.dataset.ghost = title;
+    el.style.left = gx + "px";
+    el.style.top = ghostTop() + "px";
+    el.style.width = NODE_W + "px";
+    el.style.height = NODE_H + "px";
+    el.title = reason ? "链到本晶体之外：" + reason : "链到本晶体之外";
+    el.innerHTML = '<div class="kb-v13-snode-title">↗ ' + esc(title) + "</div>";
+    ctx.canvas.appendChild(el);
+    gx += NODE_W + 24;
+  }
+}
+
+// ============================================================
+// 拖
+// ============================================================
+
+/**
+ * 把这一层的**所有线**重画一遍。
+ *
+ * 抽成独立一个函数，是因为它有两个调用时机，而第二个是必须的：
+ *   1. 整屏渲染时（renderStorylineStage）
+ *   2. **拖动一张卡的过程中**（每一帧）
+ *
+ * 少了第 2 个，线就**钉在原地不动**——卡片跑了、线还连着原来那个位置。
+ * 线的坐标是按「卡片此刻在哪」算出来的，卡片动了而不重算，它当然不动。
+ * （第一版就是这么错的：只更新了被拖那张卡的 left/top。）
+ *
+ * 只碰 SVG，不碰节点——**绝不能在这里重建节点**：被拖的那个元素一被换掉，
+ * 指针捕获就没了，拖动当场断在半路。
+ */
+function paintStoryLines(ctx, svg, cards, path, layoutMaybe) {
+  const layout = layoutMaybe || (cards.length ? layoutFor(ctx, path) : { positions: new Map() });
+  const pos = new Map();
+  for (const c of cards) pos.set(c.path, nodePosOf(ctx, c, layout));
+
+  svg.innerHTML = "";
+  ensureHandleLayer(ctx).innerHTML = "";
+  // 箭头定义得排在清空**之后**——`innerHTML = ""` 会连上一轮的 defs 一起抹掉。
+  ensureArrowDefs(svg);
+  // 显式给宽高：SVG 默认是 300×150，不给的话连线会被裁在一块小方框里。
+  // 尺寸取 layout 算出来的世界尺寸，取整免得多出一像素的滚动条。
+  const w = Math.max(1, Math.ceil(layout.meta ? layout.meta.width : 1200));
+  const h = Math.max(1, Math.ceil(layout.meta ? layout.meta.height : 800));
+  svg.setAttribute("viewBox", "0 0 " + w + " " + h);
+  svg.setAttribute("width", w);
+  svg.setAttribute("height", h);
+
+  // 3.0 刀 13：蓝线接在卡片的哪一边。**每帧建一次**，见 sideHintMap 顶上那段。
+  // 3.0 刀 46：接法的主要来源变成了**卡片自己的 frontmatter**，所以要把这一屏
+  // 的卡片传进去（按标题找目标卡）。视图状态那份在函数里面当兜底。
+  const hints = sideHintMap(ctx, cards);
+
+  // 3.0 刀 13：被右键藏掉入链出链的那几张卡。**每帧建一次**（几十项，够便宜）。
+  const hidden = hiddenCardSet(ctx);
+
+  // 3.0 刀 16：蓝线的命中几何，与 drawManualLines 的 `_manualHit` 完全对称——
+  // 框选要拿它算重叠。SVG 里的线是 `pointer-events:none` 的，事件永远轮不到它们，
+  // 只能靠这份几何。
+  //
+  // ⚠️ **在函数开头无条件重建，不能在 drawLine 里建**：`hideLinks` 打开时下面那个
+  //    循环根本不跑，不无条件清的话上一帧的数组会留下来，框选就会删到屏幕上
+  //    根本没有的线。
+  // ⚠️ 与 `_manualHit` **各归各的**：这里先跑 drawLine，`drawManualLines` 随后把
+  //    `_manualHit` 整个换掉。两个数组绝不合并。
+  const blueGeom = [];
+  ctx._blueHit = blueGeom;
+
+  // 3.0 刀 23：**外面哪几张卡连着收起来的框**。每帧无条件重建（同 blueGeom 那条）
+  // ——攒着不重置的话，框展开之后黄点会留在卡上，而它连的东西明明已经画出来了。
+  ctx._boxLinked = new Map();
+
+  // 连线画在节点**下面**：先建线，后建节点（DOM 顺序 + z-index 两条一起）。
+  const drawLine = (e, cls) => {
+    const a = pos.get(e.from);
+    const b = pos.get(e.to);
+    if (!a || !b) return;
+    // 这一头或那一头被藏了 → 这一根不画。**藏 = 不画，绝不动数据**：
+    // hiddenCardSet 一清，线原样回来。
+    if (hidden.has(e.from) || hidden.has(e.to)) return;
+    // 3.0 刀 23（用户 09-27 第 4 条）：这一头或那一头落在**收起来的框**里
+    // → 整根不画。但「那边还有东西」这件事不能丢，否则收起读起来就是「我的双链丢了」：
+    // 把**外面那一头**记下来，等下给那张卡点一个黄点；悬停它时靠这份记录让框闪。
+    //
+    // 两端都在收起来的框里（可能是两个不同的框）就没什么可点的——不记。
+    if (ctx._boxCollapsed && ctx._boxCollapsed.size && ctx._boxMember) {
+      const fa = innermostCollapsed(ctx._boxMember, ctx._boxCollapsed, e.from);
+      const fb = innermostCollapsed(ctx._boxMember, ctx._boxCollapsed, e.to);
+      const ca = !!fa;
+      const cb = !!fb;
+      if (ca || cb) {
+        if (ca !== cb && ctx._boxLinked) {
+          const outside = ca ? e.to : e.from;
+          const boxId = ca ? fa : fb;
+          if (!ctx._boxLinked.has(outside)) ctx._boxLinked.set(outside, new Set());
+          ctx._boxLinked.get(outside).add(boxId);
+        }
+        return;
+      }
+    }
+    // 这一对被亲手连过就按记下的边接，没连过就走老规矩（看谁在左谁在右）
+    const hint = hints.get(e.from + " " + e.to) || null;
+    const { aSide, bSide } = linkSidesFor(a, b, hint);
+
+    // 3.0 刀 14（用户 09-20）：「结构窗里面的连接蓝色线，从贝塞尔曲线改成和金色线
+    // 一样直线加圆弧拐角」。
+    //
+    // 原先这里画的是**贝塞尔弧**（两条控制臂横着往外推）。在库里读不清：弧线从
+    // 卡片中段穿过去，两根一交就看不出谁接谁。金色线那套**横平竖直 + 圆角**本来
+    // 就是为这件事写的（见 routePoints 顶上那段），所以蓝线直接改走同一条路。
+    //
+    // 形状既然一样了，区分就只剩**颜色和虚实**：蓝线是青色虚线、金线是暖色实线
+    // （见 styles.js 的 .kb-v13-slink-direct / .kb-v13-slink-manual，两边都别动）。
+    //
+    // ⚠️ 于是 `bezier()` 连同它那个「两头各带一个方向」的签名一起删了。
+    // 要把弧线加回来，得连同这条主接法和 storyline.spec 里那条形状断言一起改。
+    const pts = routePoints(portPos(a, aSide), aSide, portPos(b, bSide), bSide, []);
+    const path = svgEl("path");
+    path.setAttribute("d", roundedPath(pts));
+    path.setAttribute("fill", "none");
+    // 3.0 刀 16：被框中的蓝线加一个类。**直接复用金线那个 `.kb-v13-slink-picked`**，
+    // styles.js 不用改：它排在 `.kb-v13-slink-direct` 之后、同优先级，于是选中即
+    // 变红加粗，还留着 dasharray。红 = 「按下去它会没」，与金线同一套语汇；
+    // 两种线互斥（kind 只有一个值），永不同时选中。
+    path.setAttribute("class", cls + (isPickedBlue(ctx, e) ? " kb-v13-slink-picked" : ""));
+    // 端点另存一份 data-*：`<path>` 没有 x1/y1 可读，而端点是命中判定要用的东西。
+    // 与 drawManualLines 同一口径（都过 base() 取一位小数）。
+    path.setAttribute("data-x1", base(pts[0].x));
+    path.setAttribute("data-y1", base(pts[0].y));
+    path.setAttribute("data-x2", base(pts[pts.length - 1].x));
+    path.setAttribute("data-y2", base(pts[pts.length - 1].y));
+    // 箭头落在**卡片边上**，不落在正中央。连线画在节点下面（z-index 0 对 1），
+    // 落在中央的箭头会被卡片整个盖住——等于没画，而"谁链谁"就全靠它说。
+    if (e.fwd) path.setAttribute("marker-end", "url(#" + ARROW_ID + ")");
+    if (e.back) path.setAttribute("marker-start", "url(#" + ARROW_ID + ")");
+    svg.appendChild(path);
+    // 留一份几何给框选用。**被藏掉的卡在上面就 return 了**，所以看不见的线不会
+    // 进这份表——那种线留在里面，框选就会删掉一根屏幕上根本没有的线。
+    blueGeom.push({ from: e.from, to: e.to, fwd: !!e.fwd, back: !!e.back, pts });
+  };
+  // 「隐藏双链」藏的是库自己算出来的那些线。**手工连的金线永远留着**：
+  // 那是用户自己画的，不属于"可以藏起来的信息"。
+  //
+  // 3.0 刀 9-D（用户 09-19 判的）：**文件名链不再画线**。
+  // 它是按文件名排出来的先后，不是你写的「关系」——把它画成一根线、和真双链
+  // 并排摆在一张图上，等于把「我的排版意图」和「笔记里白纸黑字的事实」说成
+  // 一回事，而认错这两样正是这个库一直在防的事。排布那边照旧拿它当 x 轴基准
+  // （edgesUnder 里那条 `chain` 一个字没动），少掉的只是这一根线。
+  const { links } = edgesUnder(ctx, cards);
+  if (!ctx.state.hideLinks) {
+    for (const e of mergePairs(links)) drawLine(e, "kb-v13-slink kb-v13-slink-direct");
+  }
+  // 用户手工连的：**从连接点出发、接到连接点**，不居中——那是他自己画的，
+  // 接在哪儿就该显示在哪儿。
+  drawManualLines(ctx, svg, pos, hidden);
+}
+
+/** 故事线那一层 SVG 里箭头 marker 的 id。**每张 SVG 都要自己带一份 defs**：
+ *  `url(#id)` 是按**文档**找的，可两张 SVG 不一定同时在文档里（结构窗那张会
+ *  随窗一起从 DOM 上摘下来），靠"反正另一张有"迟早会有一边画不出箭头。 */
+const ARROW_ID = "kb-sarrow";
+
+/** 给一张 SVG 挂上箭头定义。重复调用只会覆盖同名 defs，不会越积越多。 */
+function ensureArrowDefs(svg) {
+  let defs = svg.querySelector("defs");
+  if (!defs) {
+    defs = svgEl("defs");
+    svg.insertBefore(defs, svg.firstChild);
+  }
+  const m = svgEl("marker");
+  m.setAttribute("id", ARROW_ID);
+  m.setAttribute("viewBox", "0 0 10 10");
+  m.setAttribute("refX", "9");
+  m.setAttribute("refY", "5");
+  m.setAttribute("markerWidth", "6");
+  m.setAttribute("markerHeight", "6");
+  m.setAttribute("orient", "auto-start-reverse");
+  // `auto-start-reverse` 是关键：一根线上两个头共用同一个 marker，
+  // marker-start 会自动掉头。没有它，反着来的那条边箭头会指向自己。
+  m.setAttribute("markerUnits", "userSpaceOnUse");
+  const tri = svgEl("path");
+  tri.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
+  tri.setAttribute("class", "kb-v13-sarrow");
+  m.appendChild(tri);
+  defs.appendChild(m);
+}
+
+/**
+ * 这一对卡片的两头**各接在哪一边**。
+ *
+ * `hint`（3.0 刀 13）是这一对**被亲手连过**时记下的接法——**有它就按它走**，
+ * 那是用户的明确指定，优先级最高。
+ *
+ * 没有提示时**按位置挑"面对面"的那一边**（3.0 刀 45，用户 09-30 第 1 条）。
+ */
+function linkSidesFor(a, b, hint) {
+  if (hint) return { aSide: hint.fromSide, bSide: hint.toSide };
+  // 3.0 刀 45（用户 09-30 第 1 条）：**默认不再一刀切左右。**
+  //
+  // 用户的原话：「我的卡片蓝色连线只有左右形式，没有上下形式」。原因就在这几行
+  // ——没有提示时它恒回 right/left。而**提示是存在本机视图状态里的**
+  // （`linkSides` 跟着视图状态走，不跟着卡片走），所以他把那套资料放到别人电脑上
+  // 一跑，**一条提示都不在**，整屏退化成清一色左右。他要的是「接法从排布算出来，
+  // 换哪台电脑都一样」。
+  //
+  // 判据直接复用 `nearestSide`——**和"用户自己拖一根线"用的是同一个函数**
+  // （`bindLinkMode` 里算落点是它）。这是有意的：默认和手动从此是同一把尺子，
+  // 于是手动拖过的那一条**只在"他特意挑了非最近的那一边"时才和默认不一样**，
+  // 提示表也才真的在表达"我要的不是默认那个"。
+  //
+  // ⚠️ 这一条**推翻了 09-20 那句「不要顺手改成按上下左右自动挑最近的一边」**。
+  //    当时怕的是"替所有老用户免费换一张图"；现在用户自己点名要它，而且理由更硬
+  //    ——那种接法换台电脑就没了。**别再把这段当成旧决定删掉**：两次都是用户
+  //    明确表过态的，只是方向相反。真要退回左右，改的是这一行，不是那段注释。
+  const ac = { x: a.x + NODE_W / 2, y: a.y + NODE_H / 2 };
+  const bc = { x: b.x + NODE_W / 2, y: b.y + NODE_H / 2 };
+  return { aSide: nearestSide(a, bc), bSide: nearestSide(b, ac) };
+}
+
+/**
+ * A→B 和 B→A **合画一条**，并记下方向（用户 09-19 要的）。
+ *
+ * 为什么不是两条：两张卡互相引用时，屏幕上并排摆着两根几乎重合的弧线，
+ * 谁也分不清那是「互相」还是「其中一条画歪了」。合成一条 + 两头箭头之后，
+ * 三种情形一眼可辨：只有 A 指 B / 只有 B 指 A / 两边都指。
+ *
+ * 排的是路径字典序而不是谁先写——**方向不能靠顺序推**，字典序只是给配对
+ * 一个稳定的键，谁指谁由 fwd / back 两个布尔单独记。
+ */
+function mergePairs(links) {
+  const out = new Map();
+  for (const l of links) {
+    const flip = l.from > l.to;
+    const a = flip ? l.to : l.from;
+    const b = flip ? l.from : l.to;
+    const key = a + "\u0000" + b;
+    let cur = out.get(key);
+    if (!cur) {
+      cur = { from: a, to: b, fwd: false, back: false, reason: "" };
+      out.set(key, cur);
+    }
+    if (flip) cur.back = true;
+    else cur.fwd = true;
+    if (!cur.reason && l.reason) cur.reason = l.reason;
+  }
+  return [...out.values()];
+}
+
+/** 拖动过程中重画线（只碰 SVG，不碰节点） */
+export function redrawStoryLines(ctx) {
+  const svg = ctx._sLink;
+  if (!svg || !svg.parentNode) return;
+  const path = ctx.state.crystalPath || [];
+  const cards = viewCards(ctx, path);
+  if (!cards.length) return;
+  paintStoryLines(ctx, svg, cards, path);
+}
+
+/** 只把位置写回去，不重建——拖动过程中用（重建会丢指针捕获） */
+export function applyStorylinePositions(ctx, path) {
+  // 3.0 刀 31：外来卡也要跟着走。漏掉它的症状很具体——整框拖动或整批拖动时，
+  // 外来卡**留在原地不动**，而它明明在框里（框走了、卡没走，一眼就看得出来）。
+  const cards = viewCards(ctx, path);
+  const layout = layoutFor(ctx, path);
+  // ⚠️ **先建表再铺，不要在每个节点里 `cards.find(...)`。**
+  // 3.0 刀 32 之前这个函数只在"拖整框""拖一批"时跑，慢一点无所谓；
+  // 现在**拖单张卡的每一帧**也要走它（吸附之后要拿模型重铺 DOM，见 bindStorylineDrag
+  // 的 onMove），于是那句 `find` 变成了每帧 O(n²)——一百张卡就是一帧一万次比较。
+  const at = new Map();
+  for (const c of cards) at.set(c.path, nodePosOf(ctx, c, layout));
+  for (const el of ctx.canvas.querySelectorAll(".kb-v13-snode")) {
+    const p = el.dataset.path;
+    if (!p) continue; // 幽灵节点没有路径，本来就不该被铺
+    const a = at.get(p);
+    if (!a) continue;
+    el.style.left = a.x + "px";
+    el.style.top = a.y + "px";
+  }
+}
+
+/**
+ * 拖卡片节点。机制全在 itemdrag.js 里（连那条「事件绑舞台」的教训一起），
+ * 这里只说清「节点是什么、它在哪、位置记到哪儿」。
+ *
+ * 位置记进 `crystalPos`——**它是「位置表」，不是「晶体专有的表」**：
+ * 键在这一层用的是卡片路径，和晶体 key 不会撞（路径里有斜杠）。
+ * 视图状态的顶层形状是冻结的，加不了第二个表，把语义讲清楚比加字段划算。
+ */
+export function bindStorylineDrag(ctx) {
+  // 3.0 刀 30：这一趟要一起拖的那几张（含被按住的那一张），以及它们**按下时**
+  // 各自在哪。整批拖动全靠这两样：`group` 说拖谁，`groupStart` 是那个不动的原点。
+  //
+  // 为什么原点不能拿 onMove 的第一帧凑：指针要走过 4px 阈值才触发第一帧 onMove，
+  // 拿那一帧当原点的话，整批会先**平移掉那 4px**再跟着走——而屏幕上一帧就是一次
+  // 位移，看着是"一跳"。
+  let group = null;
+  let groupStart = null;
+
+  // 3.0 刀 47（用户 10-01 第 3 条）：**金框是个容器，里面的卡不许拖到别的金框里去。**
+  //
+  // 两个变量分别是「这一趟不许进的矩形」和「最后一个合法落点」：
+  // 指针一旦把卡片中心带进某个外来的金框，就退回上一个合法位置——表现是
+  // **卡片停在那条边界上**，而不是"滑进去然后弹回来"（弹回来看着像 bug）。
+  let forbidBoxes = [];
+  let lastOk = null;
+
+  /**
+   * 把落点夹在"允许的范围"里。指针一旦把**卡片中心**带进某个外来的金框，
+   * 就退回上一个合法落点——表现是**卡片停在那条边界上**（不是滑进去再弹回来，
+   * 那看着像 bug）。
+   *
+   * 判中心而不是判整张卡，是因为归属判定（`hitBoxAt`）一直用的就是中心；
+   * 两处口径不一样的话，"能不能拖进去"和"拖进去算谁的"会给出不同答案。
+   *
+   * 顺带在这里做一次吸附：`itemdrag` 松手时拿的是**这个函数返回的值**
+   * （`drag.x/drag.y`），不吸的话松手那一刻会滑回没吸过的位置。
+   * `snapPos` 是幂等的，`onMove` 那边再吸一次不会走样。
+   */
+  const holdIn = (p) => {
+    if (!forbidBoxes.length) return p;
+    const at = snapPos(p.x, p.y, NODE_H);
+    const cx = at.x + NODE_W / 2;
+    const cy = at.y + NODE_H / 2;
+    for (const r of forbidBoxes) {
+      if (cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h) {
+        return lastOk || at;
+      }
+    }
+    lastOk = at;
+    return at;
+  };
+
+  bindItemDrag(ctx, {
+    selector: ".kb-v13-snode",
+    keyOf: (el) => el.dataset.path,
+    stage: "storyline",
+    // 连接点是控件，不是「这张卡的一部分」——按它是要拉线，不是要挪卡。
+    // 3.0 刀 31：外来卡上那颗「✕ 拿走」同理，而且这一条更实际——它只有 16px，
+    // 手一抖就超过 4px 的拖动阈值，于是 itemdrag 会把它当成一次拖动、
+    // 拖完再 `swallowNextClick` 把点击吃掉：**明明是点 ✕，卡片却挪了一点、也没有被拿走**。
+    ignore: ".kb-v13-port,.kb-v13-snode-unimport",
+    // 3.0 刀 47：金框是容器，里面的卡不许拖到别的金框里去（`holdIn` 见上）。
+    clamp: (c, path, p) => holdIn(p),
+    posOf: (c, path) => {
+      const card = c.model.byPath.get(path);
+      if (!card) return { x: 0, y: 0 };
+      return nodePosOf(c, card, layoutFor(c, c.state.crystalPath));
+    },
+    writePos: (c, path, p) => {
+      const l = layoutOf(c);
+      // ⚠️ **这里也要吸附一次。** `itemdrag` 松手时拿的是 `drag.x/drag.y`
+      // （那几个值是**没吸附过**的），它会把 `onMove` 刚写进去的吸附结果盖掉。
+      // 只在 onMove 里吸附的话，表现是"拖的时候一格一格、一松手又滑走了"。
+      const at = snapPos(p.x, p.y, NODE_H);
+      if (isForeign(c, path)) {
+        // 外来卡：位置记在本层的 `importPos` 里，**而且不写进它的文件**
+        // （见 `isForeign` 那段）。拖完这一次它就一直是这个位置了。
+        setImportPos(c, path, at);
+        return;
+      }
+      if (l.crystalPos) l.crystalPos[path] = at;
+      // 3.0 刀 34：**把坐标写进卡片自己的 frontmatter**——这是"换台电脑打开，
+      // 相对位置还一样"的**唯一**来源（视图状态是每台机器各存各的）。
+      // 走防抖：拖完停一小会儿才真写盘（用户 09-29 选的档，他有多端同步）。
+      queueCardPos(c, path, at);
+      // ⚠️ **整批拖动时，其余几张也要各自排队。** `itemdrag` 松手只拿
+      // **被抓住那一个 key** 调这里（`drag.key` 只有一个），所以上面那句只管到
+      // 主拖那张。不管其余几张的话：一次拖 5 张，文件里只写进去 1 个位置，
+      // 另外 4 张留在原处——而本地 `crystalPos` 是对的，所以**本机看起来完全正常**，
+      // 只有换一台电脑打开才露馅（那 4 张跑到别处去了）。
+      for (const [gp] of groupStart || []) {
+        if (gp === path || isForeign(c, gp)) continue;
+        const g = l.crystalPos[gp];
+        if (g) queueCardPos(c, gp, g);
+      }
+    },
+    // 按下那一下拍快照。**按住的这张在选中集里**才整批走——
+    // 框选完之后顺手去拖一张**没选中**的卡，意思显然是"我要挪这一张"，
+    // 不是"顺便把刚才那五张也带上"。
+    onStart: (c, path) => {
+      const sel = cardSel(c);
+      group = sel.indexOf(path) >= 0 ? sel.slice() : [path];
+      groupStart = new Map();
+      const cp = c.state.crystalPath || [];
+      const layout = layoutFor(c, cp);
+      for (const p of group) {
+        const card = c.model.byPath.get(p);
+        if (card) groupStart.set(p, nodePosOf(c, card, layout));
+      }
+      // 3.0 刀 47（用户第 3 条）：这一趟**不许进**的金框。
+      //
+      // 判据用**成员表**（`innermostCrystalBox` / `parent` 链），不用几何——
+      // `paths` 是递归的，"这张卡属于哪个文件夹"是确定的；而矩形会因为排布
+      // 互相重叠，"谁在谁里面"用矩形判会得到随卡片位置漂移的答案。
+      //
+      // 「外来」= **不是它的家、也不是它家的任何一层祖先**。祖先当然放行
+      // （卡在自己那个框里、以及任何一层父框的范围里走动都是应该的）。
+      //
+      // ⚠️ 位置取 `_cardHit`（上一帧渲染时留下的那份），**不重算**：
+      //    重算要跑一遍 `layoutFor` + 每张卡 `nodePosOf`，而这一趟的判据
+      //    本来就该是"按下那一刻屏幕上的样子"。
+      forbidBoxes = [];
+      lastOk = groupStart.get(path) || null;
+      const all = boxesOf(c, cp);
+      const byId = new Map(all.map((b) => [String(b.id), b]));
+      const mine = new Set();
+      for (let b = innermostCrystalBox(all, path); b; ) {
+        mine.add(String(b.id));
+        b = b.parent == null ? null : byId.get(String(b.parent));
+      }
+      const posMap = new Map();
+      for (const it of c._cardHit || []) posMap.set(it.path, { x: it.x, y: it.y });
+      const homeId = (() => {
+        const h = innermostCrystalBox(all, path);
+        return h ? String(h.id) : null;
+      })();
+      for (const b of all) {
+        if (!b.crystal || b.collapsed || mine.has(String(b.id))) continue;
+        const r = rectOf(b, posMap, NODE_W, NODE_H);
+        if (r) forbidBoxes.push(r);
+      }
+      // ⚠️ 还有**每一层祖先"自己的卡"那一块**。
+      //
+      // 珊瑚橙线分的就是这两块，而"本级的卡"**不属于任何金框**（框只发给子文件夹，
+      // 用户拍的），所以上面那一圈拦不住它：一张 B1 的卡能一路拖到 A 的文件堆里去
+      // ——而 B1 的框会跟着伸过去，**罩在人家 A 自己的卡上面**。
+      // 那正是这条约束要防的那张假图。
+      //
+      // 用**祖先的 `own` 那几张卡的包围盒**当禁区。这是个近似（那几张卡自己也可能
+      // 东一张西一张），但它是个**拖动守卫**，不是数据判据——挡早一点读起来
+      // 就是"停在那条珊瑚橙线前面"，而那正是对的。
+      for (const id of mine) {
+        if (id === homeId) continue;
+        const a = byId.get(id);
+        const own = ((a && a.own) || []).map((p) => posMap.get(p)).filter(Boolean);
+        if (!own.length) continue;
+        const x1 = Math.min(...own.map((o) => o.x));
+        const y1 = Math.min(...own.map((o) => o.y));
+        const x2 = Math.max(...own.map((o) => o.x)) + NODE_W;
+        const y2 = Math.max(...own.map((o) => o.y)) + NODE_H;
+        forbidBoxes.push({ x: x1, y: y1, w: x2 - x1, h: y2 - y1 });
+      }
+    },
+    // 拖动过程中：位置**当场写进草稿**，并把线重画一遍。
+    // 不写的话，线是按「卡片此刻在哪」算的，而它读的还是旧位置——照样不动。
+    onMove: (c, path, p) => {
+      const l = layoutOf(c);
+      if (!l.crystalPos) l.crystalPos = {};
+      const base = groupStart ? groupStart.get(path) : null;
+      const many = group && group.length > 1;
+      // 3.0 刀 32：吸附。**算的是"主拖那张"该落在哪个格点**，位移再从它倒推。
+      // 3.0 刀 47：吸附之后**再夹一次**（`holdIn` 自己也吸，幂等）。顺序反过来的话，
+      // 格点会把卡片从边界上又推回禁区里一格——表现是"还能挤进去一点点"。
+      const at = holdIn(snapPos(p.x, p.y, NODE_H));
+      // 3.0 刀 34：**外来卡的位置记在别处**（`importPos`），而且拖动过程中
+      // 每一帧都要写——它就是"我此刻把它摆在哪儿"的即时记录，和原生卡一样。
+      const own = isForeign(c, path);
+      if (many && base) {
+        // 整批：**从按下时那个原点整体平移同样的世界位移**。
+        // 逐张累加是错的——那样第一张走 10px、第二张就变成 20px 了。
+        //
+        // ⚠️ 吸附**只对主拖那一张做，位移再原样发给其余几张**。逐张各自吸附的话，
+        // 组里本来错开半格的两张会被吸到同一个格点上**叠在一起**——
+        // 一次拖动把用户的排布揉平了，而且不可逆。
+        // 代价是：整批的位置由"你抓住的是哪一张"决定，这是对的（那一张才是你对着的）。
+        const dx = at.x - base.x;
+        const dy = at.y - base.y;
+        for (const [gp, s] of groupStart) {
+          const gp_at = { x: s.x + dx, y: s.y + dy };
+          if (isForeign(c, gp)) setImportPos(c, gp, gp_at);
+          else l.crystalPos[gp] = gp_at;
+        }
+      } else if (own) {
+        setImportPos(c, path, at);
+      } else {
+        l.crystalPos[path] = at;
+      }
+      // ⚠️ 卡片这条走 `applyStorylinePositions`，**不是**只写被拖那张的 left/top：
+      //   · 整批时那几张本来就要跟着走；
+      //   · 单张时，`itemdrag` 在上面刚把**没吸附**的 x/y 写进了 DOM，
+      //     覆盖成吸附后的值只能靠它（它按模型重铺全部 left/top）。
+      // 它**只改 left/top，不重建 DOM**——重建的话被按住那一张正拿着的
+      // 指针捕获当场没掉，拖动断在半路（同方框拖动那一段的警告）。
+      applyStorylinePositions(c, c.state.crystalPath || []);
+      redrawStoryLines(c);
+      // 列表只在框选时刷新过一次，而这一趟可能重画过节点（相机、方框收起…），
+      // 高亮得补回来。它只改类名，每帧跑不心疼。
+      applyCardPicked(c);
+    },
+    // 3.0 刀 24：松手那一刻判一次归属——**拖进框 / 拖出框都走这一下**
+    // （用户 09-27 拍的：拖进去 = 加入，拖到框外 = 移出）。
+    //
+    // ⚠️ `onDrop` 拿到的是 `(ctx, key)`，**没有坐标**；但它在 `writePos` **之后**
+    // 才跑，所以位置已经落定了，回头从 `layoutOf().crystalPos` 读就行
+    // （`modules.js` 的 `dropCrystal` 就是这条现成的路子）。
+    //
+    // 判的是**卡片中心**而不是左上角：`crystalPos` 存的是左上角，
+    // 而用户眼里"这张卡在不在框里"看的是整张卡。
+    //
+    // 3.0 刀 30：**一次判一整批**（用户 09-27：「更不能这样移动到收纳方框里面」）。
+    // 单独一张那条老路一个字没变——它只是"这批只有一张"的特例。
+    onDrop: (c, path) => {
+      // ⚠️ 先把这一趟的状态放掉。下面有几条提前 return（没框 / 拿不到位置），
+      // 漏放的话下一趟 onStart 之前 `group` 还指着上一批——而 onStart 一定会
+      // 覆盖它，所以真正会出事的是**别的地方**将来读到它。放了干净。
+      const sel = cardSel(c);
+      const targets = sel.indexOf(path) >= 0 && sel.length ? sel.slice() : [path];
+      group = null;
+      groupStart = null;
+      const cp = c.state.crystalPath || [];
+      const boxes = boxesOf(c, cp);
+      if (!boxes.length) return;
+      const layout = layoutFor(c, cp);
+      const pos = new Map();
+      // ⚠️ 3.0 刀 31：**必须带上外来卡**，否则"把引进来那张拖进框"这条主路是死的
+      // ——`assignCards` 从这张表里取位置，取不到就 `continue`，
+      // 于是松手之后什么也没发生，而用户明明把它拖进框里了。
+      for (const card of viewCards(c, cp)) pos.set(card.path, nodePosOf(c, card, layout));
+      // 一次算完、一次落盘。一张一张调的话，一次拖 8 张 = 8 次整窗重画
+      // （`afterWrite` 里带着 `refreshStoryline`），屏幕上会一顿一顿地闪。
+      const res = assignCards(c, targets, boxes, pos, NODE_W, NODE_H);
+      // 3.0 刀 31：**只有"外来卡掉进子晶体框"才说话。**
+      //
+      // 为什么别的都不说：本层的卡本来就住在自己那个子晶体框里，拖一下十有八九
+      // 还落在同一个框上——每拖一次弹一句，那才是真的吵。
+      // 而外来卡不一样：它**没有任何文件夹**，所以永远进不了任何子晶体框，
+      // 拖进去是**注定什么都不会发生**的一下。那正是这个库里最忌讳的
+      // 「点了没反应」，而这里恰好有一句现成的话可以说。
+      const imported = new Set(importsOf(c));
+      if (res.crystalHit && targets.some((p) => imported.has(p)) && c.say) {
+        c.say(
+          "这是子晶体框——它的成员是文件夹长出来的，装不进外来卡。要给它分组，用「＋ 框」建一个手动框。",
+          false
+        );
+      }
+    },
+  });
+}
+
+/**
+ * 点节点：正常节点打开那张卡的面板；**幽灵节点跳到它所在的那颗晶体**。
+ *
+ * 幽灵是「链到本晶体之外」的那一头，它存在的意义就是「这条边不是没了，
+ * 只是那一头在别处」——所以点它必须真的带人过去，否则它只是个装饰。
+ */
+export function bindStorylineClicks(ctx) {
+  ctx.canvas.addEventListener("click", (e) => {
+    if (ctx.state.stage !== "storyline") return;
+    const el = e.target && e.target.closest && e.target.closest(".kb-v13-snode");
+    if (!el) return;
+    e.stopPropagation();
+    if (el.dataset.ghost) {
+      const card = ctx.model.cardByTitle(el.dataset.ghost);
+      if (card && card.crystal && ctx.gotoCrystal) ctx.gotoCrystal(card.crystal);
+      return;
+    }
+    const card = ctx.model.byPath.get(el.dataset.path);
+    if (card) ctx.openCardPanel(card);
+  });
+}
+
+// ============================================================
+// 手工连线（连接模式）
+// ============================================================
+//
+// 交互是用户定的：**空白处右键**进连接模式（四边中点的小圆点全亮出来，
+// 这时点卡片不进卡），连好之后**左键点空白**退出来，单击又能进卡了。
+//
+// 比「双击进卡」好在两点：**不改任何既有习惯**（单击进卡原样保留），
+// 而且屏幕上始终有一个明确的「现在处于什么状态」——那正是这类模式该给的。
+
+/** 四个方向。顺序与 CSS 里的定位对应，改一处要连着改另一处。 */
+/**
+ * 四个方向。**名册本身住在 `frontmatter.js`**（那边同时管着存进文件的字母），
+ * 这里只是换个名字再 export 一次——老调用方认的还是 `LINK_SIDES`。
+ *
+ * 3.0 刀 46 之前这份名册就长在这一行上，而 `frontmatter.js` / `viewstate.js`
+ * 各有一份拷贝，靠注释写着"顺序要一致"。探针逮到过一次它们错位的后果
+ * （写进用户卡片的方向是错的），所以收成了一处。
+ */
+export const LINK_SIDES = SIDE_NAMES;
+
+/** 四个方向「朝外」是哪一边。橡皮筋从连接点出去时要顺着它。 */
+const SIDE_DIR = {
+  top: { x: 0, y: -1 },
+  bottom: { x: 0, y: 1 },
+  left: { x: -1, y: 0 },
+  right: { x: 1, y: 0 },
+};
+
+/** 某个方向的连接点在**世界坐标**里的位置 */
+export function portPos(node, side) {
+  const c = { x: node.x + NODE_W / 2, y: node.y + NODE_H / 2 };
+  if (side === "top") return { x: c.x, y: node.y };
+  if (side === "bottom") return { x: c.x, y: node.y + NODE_H };
+  if (side === "left") return { x: node.x, y: c.y };
+  return { x: node.x + NODE_W, y: c.y };
+}
+
+/** 这个晶体上手工连的线 */
+export function manualLinks(ctx) {
+  const v = layoutOf(ctx);
+  const all = v.cardLinks && typeof v.cardLinks === "object" ? v.cardLinks : {};
+  const key = (ctx.state.crystalPath || []).join(" ");
+  return Array.isArray(all[key]) ? all[key] : [];
+}
+
+function writeManualLinks(ctx, list) {
+  const v = layoutOf(ctx);
+  if (!v.cardLinks || typeof v.cardLinks !== "object") v.cardLinks = {};
+  const key = (ctx.state.crystalPath || []).join(" ");
+  if (list.length) v.cardLinks[key] = list;
+  else delete v.cardLinks[key];
+  if (ctx.persistViewState) ctx.persistViewState();
+}
+
+/** 字典序规范序：小的在前。判据必须与 mergePairs 的 `l.from > l.to` 是同一句。 */
+function canonical(x, y) {
+  return x <= y ? [x, y, false] : [y, x, true];
+}
+
+/**
+ * 记下「这一对卡片接在哪儿」（3.0 刀 13）。**只记，不画。**
+ *
+ * 画是 paintStoryLines 的事，写盘是 ctx.persistViewState 那根线的事——这一层
+ * 两样都不认识。形状与 writeManualLinks 逐句对应（同一套 layoutOf + 按键去空 +
+ * persist），这样"记东西"在这两个地方长得一样，读的人不用记两套。
+ *
+ * 存的是**规范序**（与 mergePairs 同一套），查找时两个方向都试（见 sideHintMap）。
+ */
+function writeLinkSide(ctx, from, to, fromSide, toSide) {
+  if (!from || !to || from === to) return;
+  // 3.0 刀 46：**主路改成写进「源卡自己」的 frontmatter**（用户 10-01）。
+  // 这条路让接法跟着文件走——改名、搬到别的文件夹、压缩发给别人，都带着。
+  // 存进去的是**目标卡的标题**（写成 `[[标题]]` 的形状，好让 Obsidian 改名时
+  // 连它一起改），源卡这边是 `fromSide`，目标卡那边是 `toSide`。
+  const target = ctx.model && ctx.model.byPath ? ctx.model.byPath.get(to) : null;
+  if (
+    target &&
+    target.title &&
+    setCardSide(ctx, from, target.title, sideLetter(fromSide) || "r", sideLetter(toSide) || "l")
+  ) {
+    return;
+  }
+  // 落不下去（源卡不在模型里之类）→ 退回视图状态那份。
+  // ⚠️ 它现在是**兜底**不是主路：读的时候 frontmatter 优先（见 `sideHintMap`），
+  //    所以这里记的那一份只在这一台机器上管用，而且下次开库会被迁移搬进文件。
+  const [a, b, flip] = canonical(from, to);
+  const v = layoutOf(ctx);
+  if (!v.linkSides || typeof v.linkSides !== "object") v.linkSides = {};
+  const key = (ctx.state.crystalPath || []).join(" ");
+  const list = (Array.isArray(v.linkSides[key]) ? v.linkSides[key] : [])
+    // 同一对只留最新的一次：用户重新拖一遍说的是"改成这样"，不是"再加一条"
+    .filter((l) => !(l && l.from === a && l.to === b));
+  list.push(
+    flip
+      ? { from: a, to: b, fromSide: toSide, toSide: fromSide }
+      : { from: a, to: b, fromSide, toSide }
+  );
+  v.linkSides[key] = list;
+  if (ctx.persistViewState) ctx.persistViewState();
+}
+
+/**
+ * 此刻藏起来的那几张卡（3.0 刀 13）。**每一帧建一次 Set**（几十项，够便宜）。
+ *
+ * 与 sideHintMap 同一条纪律：**不做成 ctx 上的缓存**——结构窗的影子对象有一张
+ * "必须归零的单槽位"名单，多一个槽位就多一处漏归零。
+ */
+export function hiddenCardSet(ctx) {
+  const v = layoutOf(ctx);
+  const list = Array.isArray(v.hiddenLinks) ? v.hiddenLinks : [];
+  return new Set(list.filter((p) => typeof p === "string" && p));
+}
+
+/** 这一张卡的入链出链是不是被藏了 */
+export function isCardHidden(ctx, path) {
+  return !!path && hiddenCardSet(ctx).has(path);
+}
+
+function writeHiddenSet(ctx, set) {
+  const v = layoutOf(ctx);
+  v.hiddenLinks = [...set];
+  if (ctx.persistViewState) ctx.persistViewState();
+}
+
+/**
+ * 藏 / 显回一张卡（3.0 刀 13。用户 09-20 定的：**同一张卡再右键一次就是显回来**）。
+ *
+ * 存的是**卡片路径**不是标题：关系图那张表是按 title 建的，跨文件夹同名会让边
+ * 指错人（见 edgesUnder 顶上那段）。藏东西这件事不能认错人。
+ *
+ * 重画走 `ctx.refreshStoryline`（整屏）而**不是** `redrawStoryLines`——卡片上那个
+ * 「线已藏」标记也要跟着变，而后者按设计只碰 SVG、**绝不重建节点**
+ * （见 renderStorylineStage 顶上那段：被拖的那个元素一换掉，指针捕获就没了）。
+ */
+export function toggleHiddenCard(ctx, path) {
+  if (!path) return false;
+  const set = hiddenCardSet(ctx);
+  if (set.has(path)) set.delete(path);
+  else set.add(path);
+  writeHiddenSet(ctx, set);
+  if (ctx.refreshStoryline) ctx.refreshStoryline();
+  if (ctx.refreshStageUi) ctx.refreshStageUi();
+  return set.has(path);
+}
+
+/**
+ * 顶栏那颗「显示全部」：**一次全显回来**（3.0 刀 13）。
+ *
+ * 没有藏着的东西时什么都不做——不落盘、不重画、也不弹一句话。那颗按钮本来
+ * 就只在真有东西可显的时候才出场。
+ *
+ * @returns {number} 显回来了几张
+ */
+export function showAllHidden(ctx) {
+  const n = hiddenCardSet(ctx).size;
+  if (!n) return 0;
+  writeHiddenSet(ctx, new Set());
+  if (ctx.refreshStoryline) ctx.refreshStoryline();
+  if (ctx.refreshStageUi) ctx.refreshStageUi();
+  return n;
+}
+
+/**
+ * 这一屏所有的蓝线接法提示，做成一张 Map（3.0 刀 13）。**每一帧建一次。**
+ *
+ * 两个方向**各插一份**：存进去的是规范序（与 mergePairs 同一套），而渲染时拿到的
+ * from/to 是**另一处实现**的约定——两处靠"我们记得同步改"来对齐，正是这个仓最爱
+ * 出事的地方。各插一份的代价是一次比较，换来的是"文件被手改过顺序也不会静默丢掉
+ * 一条提示"。
+ *
+ * ⚠️ **不做成 ctx 上的缓存**：结构窗的影子对象有一张"必须归零的单槽位"名单
+ * （见 embedstory.js 的 makeFacade），多一个槽位就多一处漏归零——症状是结构窗
+ * 用着**库那一屏**的提示。几十项的 Map 每帧建一次，不值得为它冒那个险。
+ */
+function sideHintMap(ctx, cards) {
+  const out = new Map();
+  const v = layoutOf(ctx);
+  const all = v.linkSides && typeof v.linkSides === "object" ? v.linkSides : {};
+  const key = (ctx.state.crystalPath || []).join(" ");
+  const put = (list) => {
+    if (!Array.isArray(list)) return;
+    for (const l of list) {
+      if (!l || !l.from || !l.to) continue;
+      out.set(l.from + " " + l.to, { fromSide: l.fromSide, toSide: l.toSide });
+      out.set(l.to + " " + l.from, { fromSide: l.toSide, toSide: l.fromSide });
+    }
+  };
+  // ---- 1) 兜底：**视图状态里那份**（老数据，正在被迁移搬进文件）----
+  //
+  // 3.0 刀 42（用户 09-30 第 4 条）：**别的层的接法也算数。**
+  //
+  // 原来这里只读 `all[key]`——就是当前这一层那一格。可「接法」是**一对卡片
+  // 之间**的事：`writeLinkSide` 拿层当键，只是因为"用户当时站在哪一层"是最省事
+  // 的写法，不是因为它俩的关系属于那一层。于是同一个文件夹里的两张卡：
+  //   · 进到那颗晶体里看 → 用他拖过的那套接法，线从他拖的那一边出去；
+  //   · 站在外面看那个金色方框 → 查不到提示，退回默认的——
+  //     **同一对卡、同一根线，走线形状不一样**，而屏幕上没有任何东西解释这件事。
+  //
+  // ⚠️ **本层的最后放**：同一对卡在两个层都记过时以当前这一层为准。
+  // ⚠️ 键里的分隔符是**真的 NUL 字节**（\x00 那个字符本身），不是空格。它和
+  //    `mergePairs` / `edgesUnder` 用的是同一个字符，改一处就得改全部——
+  //    而这两边一旦不一致，表现是**接法静默失效**（查不到就是没提示），
+  //    不报错、也不是"接歪了"，是"我明明拖过它还是老样子"。
+  for (const k of Object.keys(all)) {
+    if (k === key) continue;
+    put(all[k]);
+  }
+  put(all[key]);
+  // ---- 2) 主源：**卡片自己 frontmatter 里那份**（3.0 刀 46，用户 10-01）----
+  //
+  // 用户把这颗晶体压缩发给别人（他拿这个在卖），对方打开之后线全变成左右。
+  // 根因：接法只活在视图状态里，而且键是"当时站在哪一层"——换台电脑是空的，
+  // 换个文件夹路径也对不上。现在它写在**源卡自己的 frontmatter**（「晶体接法」），
+  // 于是跟着卡片走：改名、搬文件夹、压缩发走，都带着。
+  //
+  // ⚠️ **排在后面**：同一对卡两处都有记录时**以文件里那份为准**。文件那份才是
+  //    能跟着卡片走的那个；本机那份只是还没迁完的老数据。
+  // ⚠️ 目标按**标题**找，而标题在库里可能重名——所以只在**这一屏**（`cards`）
+  //    里找，找不到就当这条没有（同 `edgesUnder` 那条"同名卡会让边指错人"）。
+  const byTitle = new Map();
+  for (const c of cards) if (!byTitle.has(c.title)) byTitle.set(c.title, c);
+  for (const c of cards) {
+    const list = Array.isArray(c.sides) ? c.sides : [];
+    for (const e of list) {
+      if (!e || !e.title) continue;
+      const target = byTitle.get(e.title);
+      if (!target) continue;
+      const mine = sideName(e.mine);
+      const its = sideName(e.its);
+      if (!mine || !its) continue;
+      out.set(c.path + " " + target.path, { fromSide: mine, toSide: its });
+      out.set(target.path + " " + c.path, { fromSide: its, toSide: mine });
+    }
+  }
+  return out;
+}
+
+
+/** 位置表：这一层每张卡此刻在哪（世界坐标） */
+function posMapOf(ctx, path, layout) {
+  const m = new Map();
+  // 3.0 刀 31：外来卡也要在这张表里。它管着**拖一根线**——表里没有那张卡的话，
+  // 从它身上拉不出线，也连不到它身上（`bindLinkMode` 两头都查这张表）。
+  for (const c of viewCards(ctx, path)) m.set(c.path, nodePosOf(ctx, c, layout));
+  return m;
+}
+
+function drawManualLines(ctx, svg, pos, hidden) {
+  // 每画一根就把它**走过的折线**留一份。命中判定（点线选中、双击加拐点）
+  // 全靠这个：SVG 里的线是 pointer-events:none 的，事件永远轮不到它们，
+  // 只能拿指针位置去和这份几何算距离。
+  const geom = [];
+  ctx._manualHit = geom;
+  const editing = isLineEdit(ctx);
+  const all = manualLinks(ctx);
+  for (let index = 0; index < all.length; index++) {
+    const l = all[index];
+    const a = pos.get(l.from);
+    const b = pos.get(l.to);
+    // 连到一张已经不在这屏上的卡：**安静地少画这一根**，不报错、也不清数据。
+    // 卡片可能只是暂时不在这儿（被挪去了别的文件夹），清掉就找不回来了。
+    if (!a || !b) continue;
+    // 3.0 刀 13：这张卡被右键藏了 → 它的金线一起藏。
+    //
+    // ⚠️ **必须在这里就退出**，不能只是"不 appendChild"。`_manualHit` 是右键 /
+    // 框选 / 双击加拐点的**唯一**命中来源；一根看不见的线留在里面，症状是
+    // 「右键空白处却进了连线编辑模式」「框选删掉了一根我看不见的线」——
+    // 两样都不报错，而且都是"删了/改了用户没打算动的东西"那一类。
+    if (hidden && (hidden.has(l.from) || hidden.has(l.to))) continue;
+    const pts = routePoints(portPos(a, l.fromSide), l.fromSide, portPos(b, l.toSide), l.toSide, l.bends);
+    const on = isPicked(ctx, l);
+    const path = svgEl("path");
+    path.setAttribute("d", roundedPath(pts));
+    path.setAttribute("fill", "none");
+    path.setAttribute(
+      "class",
+      "kb-v13-slink kb-v13-slink-manual" + (on ? " kb-v13-slink-picked" : "")
+    );
+    path.setAttribute("data-x1", base(pts[0].x));
+    path.setAttribute("data-y1", base(pts[0].y));
+    svg.appendChild(path);
+    // 留一份几何给命中判定用（见 hitManual 上面那段）。**下标也要留**：
+    // 加拐点时要写回 manualLinks 里对的那一条。
+    geom.push({ index, link: l, pts });
+    // 抓手在**编辑模式里全部摆出来**。不再要求"先选中某一根"——左键选中那套
+    // 被换掉了（见上面的说明），抓手就得有个不依赖它的出场方式。
+    if (editing) drawBendHandles(ctx, l);
+  }
+  // 框选的矩形。画在最后 = 压在所有的线和抓手之上，扫过去看得清。
+  const marquee = ctx.state.marqueeRect;
+  if (marquee) {
+    const r = svgEl("rect");
+    r.setAttribute("x", base(marquee.x));
+    r.setAttribute("y", base(marquee.y));
+    r.setAttribute("width", base(Math.max(0, marquee.w)));
+    r.setAttribute("height", base(Math.max(0, marquee.h)));
+    r.setAttribute("class", "kb-v13-marquee");
+    ensureHandleLayer(ctx).appendChild(r);
+  }
+}
+
+/**
+ * 选中的那根线上，每个拐点摆一个小圆点——双击加出来的拐点要看得见、抓得住。
+ *
+ * `pointer-events:auto` **必须显式写**（在 styles.js 里）：SVG 自己是 `none`，
+ * 圆点不写这一句就继承不到事件，拖它、双击它全部落空而且不报错。
+ * 这条规律这一轮踩到第四次了。
+ *
+ * 位置取 **`link.bends`（用户自己加的那几个）**，不是画出来的折线上的每个顶点
+ * ——正交化会自动补出一堆"直角点"（出线那一小段的尽头就是一个），
+ * 它们不是用户加的东西，摆上抓手会让人以为那些也能拖。
+ *
+ * ⚠️ 这里的 dataset 是拖动时的**身份凭据**（从 from/to + 坐标找回是哪一个拐点），
+ * 所以坐标要原样写进去，别做四舍五入——`base()` 只用于显示用的 cx/cy。
+ */
+function drawBendHandles(ctx, link) {
+  const svg = ensureHandleLayer(ctx);
+  for (const b of Array.isArray(link.bends) ? link.bends : []) {
+    if (!b || !Number.isFinite(b.x) || !Number.isFinite(b.y)) continue;
+    const c = svgEl("circle");
+    c.setAttribute("cx", base(b.x));
+    c.setAttribute("cy", base(b.y));
+    c.setAttribute("r", 5);
+    c.setAttribute("class", "kb-v13-sbend");
+    c.dataset.from = link.from;
+    c.dataset.to = link.to;
+    c.dataset.bx = String(b.x);
+    c.dataset.by = String(b.y);
+    svg.appendChild(c);
+  }
+}
+
+// ============================================================
+// 金色的手工线：怎么走（3.0 刀 5 第二轮）
+// ============================================================
+//
+// 用户要的是**流程图那种折线**：只走横平竖直，拐弯处带弧度。原来的贝塞尔弧
+// 好看，但它表达的是"这两头有关系"，而流程图折线表达的是"从这儿到那儿怎么走"
+// ——手工线是他一条条自己连的，本来就更像后者。
+//
+// 拐点由**双击线身**加出来（再双击那个圆点去掉），拖动圆点可以摆位置。
+
+/** 小于这个就当零。浮点坐标别拿 `=== 0` 判 */
+const EPS = 0.5;
+/** 出线先直走一小段再拐——流程图里那截"引线"，没有它线会贴着卡片边走 */
+const STUB = 22;
+/** 要绕行时多让出去多少 */
+const CLEAR = 30;
+/** 拐角的圆角半径 */
+const CORNER = 10;
+
+const round1 = (v) => Math.round(v * 10) / 10;
+const base = round1;
+
+/** 两点之间那一小段的单位向量（从 b 指向 a） */
+function unitTo(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  const d = Math.hypot(dx, dy);
+  if (d < 0.001) return { x: 0, y: 0, d: 0 };
+  return { x: dx / d, y: dy / d, d };
+}
+
+function axisOf(side) {
+  return side === "top" || side === "bottom" ? "v" : "h";
+}
+
+function step(p, dir, n) {
+  return { x: p.x + dir.x * n, y: p.y + dir.y * n };
+}
+
+/**
+ * 把一串点连成**只走横平竖直**的折线：相邻两点若 x、y 都不同，中间补一个直角拐点。
+ *
+ * 补哪个方向的拐点由 `axis`（此刻的走向）决定——先沿当前方向走，再拐。
+ * 于是"出线沿着端口方向"这条能一路传下去，第一次拐弯不会莫名其妙地竖着出。
+ */
+function orthogonalize(raw, startAxis) {
+  const out = [raw[0]];
+  let axis = startAxis;
+  for (let i = 1; i < raw.length; i++) {
+    const p = raw[i];
+    let q = out[out.length - 1];
+    if (Math.abs(p.x - q.x) > EPS && Math.abs(p.y - q.y) > EPS) {
+      const e = axis === "h" ? { x: p.x, y: q.y } : { x: q.x, y: p.y };
+      out.push(e);
+      q = e;
+    }
+    if (Math.abs(p.x - q.x) > EPS) axis = "h";
+    else if (Math.abs(p.y - q.y) > EPS) axis = "v";
+    out.push(p);
+  }
+  return out;
+}
+
+/** 去掉重合的相邻点（正交化之后很容易冒出零长段，圆角那一步会被它除零） */
+function dedupe(pts) {
+  const out = [];
+  for (const p of pts) {
+    const q = out[out.length - 1];
+    if (q && Math.abs(p.x - q.x) < 0.01 && Math.abs(p.y - q.y) < 0.01) continue;
+    out.push(p);
+  }
+  return out;
+}
+
+/**
+ * 一条手工线走的折线（世界坐标）。
+ *
+ * 没有拐点时用**认端口的默认走法**：从出线那一侧先走一小段，再拐。
+ * 两侧都是横的（最常见的"右边出、左边进"）走"横—竖—横"，线从中间那道竖井穿过去，
+ * 一眼能看出是从哪张卡到哪张卡；一横一竖就走一个直角。**这一步不做就只是根
+ * 斜线换个画法**，流程图那个味道全在"认端口"上。
+ */
+export function routePoints(a, aSide, b, bSide, bends) {
+  const dirA = SIDE_DIR[aSide] || { x: 1, y: 0 };
+  const dirB = SIDE_DIR[bSide] || { x: -1, y: 0 };
+  const s0 = step(a, dirA, STUB);
+  const s1 = step(b, dirB, STUB);
+  const user = (Array.isArray(bends) ? bends : []).filter(
+    (p) => p && Number.isFinite(p.x) && Number.isFinite(p.y)
+  );
+
+  const mid = [];
+  if (user.length) {
+    mid.push(...user);
+  } else if (axisOf(aSide) === "h" && axisOf(bSide) === "h") {
+    if (Math.sign(s1.x - s0.x) === Math.sign(dirA.x)) {
+      const mx = (s0.x + s1.x) / 2;
+      mid.push({ x: mx, y: s0.y }, { x: mx, y: s1.y });
+    } else {
+      // 反向（比如右边出、左边进，但那张卡其实在左边）：**贴着两边绕出去**，
+      // 直连会横穿两张卡自己。多两个拐，但读得懂。
+      const my = (s0.y + s1.y) / 2;
+      const ox = s0.x + dirA.x * CLEAR;
+      const ix = s1.x + dirB.x * CLEAR;
+      mid.push({ x: ox, y: s0.y }, { x: ox, y: my }, { x: ix, y: my }, { x: ix, y: s1.y });
+    }
+  } else if (axisOf(aSide) === "v" && axisOf(bSide) === "v") {
+    if (Math.sign(s1.y - s0.y) === Math.sign(dirA.y)) {
+      const my = (s0.y + s1.y) / 2;
+      mid.push({ x: s0.x, y: my }, { x: s1.x, y: my });
+    } else {
+      const mx = (s0.x + s1.x) / 2;
+      const oy = s0.y + dirA.y * CLEAR;
+      const iy = s1.y + dirB.y * CLEAR;
+      mid.push({ x: s0.x, y: oy }, { x: mx, y: oy }, { x: mx, y: iy }, { x: s1.x, y: iy });
+    }
+  } else if (axisOf(aSide) === "h") {
+    mid.push({ x: s1.x, y: s0.y });
+  } else {
+    mid.push({ x: s0.x, y: s1.y });
+  }
+
+  const out = dedupe(orthogonalize([a, s0, ...mid, s1, b], axisOf(aSide)));
+
+  // 最后一截必须**顺着目标端口的方向扎进去**（就是那段 STUB 的延长线）。
+  // 加了拐点之后正交化可能让它横着撞到卡边上——补一个点掰回来。
+  const i = out.findIndex((p) => p === s1);
+  if (i >= 1) {
+    const prev = out[i - 1];
+    const lastAxis = Math.abs(prev.x - s1.x) > EPS ? "h" : "v";
+    if (lastAxis !== axisOf(bSide)) {
+      out.splice(
+        i,
+        0,
+        axisOf(bSide) === "h" ? { x: prev.x, y: s1.y } : { x: s1.x, y: prev.y }
+      );
+    }
+  }
+  return dropCollinear(dedupe(out));
+}
+
+/**
+ * 去掉「三点共线」的中间点。
+ *
+ * **不是洁癖，是必须的**：圆角那一步只认"拐角"，而共线的中间点在它眼里
+ * 是一个 180° 的回头弯——于是会在那儿抹出一个**半圆形的鼓包**，
+ * 线上凭空多出一个钩子。正交化那一步很爱造这种点（比如"先横后竖"的中间点
+ * 正好落在两端连线上时），所以必须在这儿清掉。
+ *
+ * 判据是**偏离直线的像素距离**，不是角度：角度判据在长段上极小的偏差也算拐角，
+ * 而那点偏差圆角一放大就是个鼓包。用户双击加出来的拐点常常离原地线零点几像素
+ * （他点的就是线上），角度判据会说"这是个拐角"，屏幕上于是多出一个看不出来的
+ * 小疙瘩——累积几处就很脏。按"偏了不到一个像素"来判，这种点直接当直的。
+ */
+function dropCollinear(pts) {
+  const out = [pts[0]];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const a = out[out.length - 1];
+    const b = pts[i];
+    const c = pts[i + 1];
+    const span = Math.hypot(c.x - a.x, c.y - a.y);
+    if (span < 0.01) continue;
+    const cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if (Math.abs(cross) / span < 0.9) continue;
+    out.push(b);
+  }
+  if (pts.length > 1) out.push(pts[pts.length - 1]);
+  return out;
+}
+
+/** 折线 → 带圆角的 SVG `d`。拐角用二次贝塞尔抹一下，半径取相邻两段的一半以内，圆角不会打架 */
+function roundedPath(pts) {
+  if (!pts.length) return "";
+  let d = "M " + base(pts[0].x) + " " + base(pts[0].y);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    const c = pts[i + 1];
+    const v1 = unitTo(a, b);
+    const v2 = unitTo(c, b);
+    const r = Math.min(CORNER, v1.d / 2, v2.d / 2);
+    if (!(r > 0.6)) {
+      d += " L " + base(b.x) + " " + base(b.y);
+      continue;
+    }
+    d +=
+      " L " + base(b.x + v1.x * r) + " " + base(b.y + v1.y * r) +
+      " Q " + base(b.x) + " " + base(b.y) + " " +
+      base(b.x + v2.x * r) + " " + base(b.y + v2.y * r);
+  }
+  const last = pts[pts.length - 1];
+  d += " L " + base(last.x) + " " + base(last.y);
+  return d;
+}
+
+/** 连接模式开着吗（运行时状态，**不落盘**——它是一次操作中途的状态，不是场景） */
+export function isLinking(ctx) {
+  return !!ctx.state.linking;
+}
+
+/**
+ * 离开故事线这一屏：把**只属于它**的几样东西收干净。
+ *
+ * 右键菜单挂在 body 上（不随舞台重建而消失），连接模式和选中态是运行时状态。
+ * 不收的话表现是：切回卡阵了，屏幕角落还挂着一个「删除实线」，点了删的是
+ * 一个已经看不见的东西。
+ */
+export function leaveStoryline(ctx) {
+  clearPicked(ctx);
+  setLineEdit(ctx, false);
+  setLinking(ctx, false);
+}
+
+export function setLinking(ctx, on) {
+  const next = !!on;
+  if (ctx.state.linking === next) return false;
+  ctx.state.linking = next;
+  if (ctx.fs) ctx.fs.classList.toggle("kb-v13-linking", next);
+  if (ctx.refreshStageUi) ctx.refreshStageUi();
+  return true;
+}
+
+/**
+ * 连接模式的进出与「拖一根线到另一张卡」。
+ *
+ * ⚠️ 拖动那一套纪律和 itemdrag 一样：**pointermove/pointerup 绑舞台**。
+ * 世界层是 pointer-events:none 的，指针一离开卡片的矩形，事件就冒泡不到它上面。
+ * 连接点只有 12px，比什么都容易出界——这一轮已经在同一个坑里摔过三次了。
+ */
+export function bindLinkMode(ctx) {
+  const g = ctx.stage;
+  let drag = null;
+
+  // 右键：**落在金线上是弹菜单，落在空白才是进连接模式**。
+  //
+  // 顺序不能反。反过来的话，想删线的人一右键就被弹进连接模式——那是一个他
+  // 找不到出口的模式（屏幕上只多出一些小圆点），而他要的菜单根本没出现。
+  // 一条线上「右键」只有一种合理解释，所以这里不需要额外的修饰键。
+  //
+  // **必须 preventDefault**：不拦的话宿主会弹出自己的菜单，把这一下盖掉——
+  // 用户看到的是「按了没反应，还弹了个菜单」。
+  g.addEventListener("contextmenu", (e) => {
+    if (ctx.state.stage !== "storyline") return;
+    e.preventDefault();
+    e.stopPropagation();
+    // 3.0 刀 13（用户 09-20）：「鼠标对着卡片右键，隐藏这张卡片所有的入链和出链」。
+    //
+    // **必须排在 hitManual 前面**：卡片节点 z-index 1、线在 0，事件本来就落在卡上；
+    // 而 hitManual 是按**世界坐标算距离**的，压在这张卡底下的一段金线照样会被
+    // "命中"——排在后头的话，右键一张卡有时进连线编辑模式、有时藏，全看线正好
+    // 从哪儿过。
+    //
+    // 入口由**写模式**开：平时右键卡片仍然是"进连接模式"（那条是用户 09-19 定的，
+    // 一个字不动）。「已经藏了」也算一条进路——不这么写的话，切回「看」那一档
+    // 之后右键卡片会被弹进连接模式，藏起来的东西就只剩顶栏那颗按钮能救了。
+    const node = e.target && e.target.closest && e.target.closest(".kb-v13-snode");
+    const cardPath = node && node.dataset.path;
+    if (cardPath && (ctx.state.linkWrite || isCardHidden(ctx, cardPath))) {
+      toggleHiddenCard(ctx, cardPath);
+      return;
+    }
+    const w = ctx._panzoom ? ctx._panzoom.clientToWorld(e.clientX, e.clientY) : null;
+    const hit = w ? hitManual(ctx, w) : null;
+    if (hit) {
+      // 落在金线上 = 进**连线编辑模式**（按住 S 框选、按 D 删）。
+      // 同时退出连接模式：两个模式各说各的，同时开着的话屏幕上既有连接点
+      // 又能框选，谁也说不清这一下点下去算什么。
+      //
+      // ⚠️ `setMarqueeKind` 必须排在 `setLineEdit` **前面**：后者在已经是 true 时
+      //    提前返回、根本不刷界面，顶栏那颗按钮的标签会停在上一档那三个字上。
+      setMarqueeKind(ctx, "manual");
+      setLinking(ctx, false);
+      setLineEdit(ctx, true);
+      return;
+    }
+    // 3.0 刀 16（用户 09-20）：「写模式下，右键之后，这个结构窗顶栏出现按钮：选框」。
+    //
+    // ⚠️ **连接模式不能退**：写模式存在的理由就是从连接点拖出 `[[目标卡]]`；
+    //    退了的话「右键一次」= 这扇窗再也写不进新线，而屏幕上只是少了一圈小圆点，
+    //    **不报错**。两档共存是安全的——框选那条路要 `isMarqueeArmed` 才抢指针
+    //    （捕获 + stopImmediatePropagation），没点「选框」之前，连接点上的按下
+    //    照旧归 bindLinkMode。
+    if (ctx.state.linkWrite) {
+      setMarqueeKind(ctx, "blue");
+      setLinking(ctx, true);
+      setLineEdit(ctx, true);
+      return;
+    }
+    setMarqueeKind(ctx, "manual");
+    setLineEdit(ctx, false);
+    setLinking(ctx, true);
+  });
+
+  g.addEventListener("pointerdown", (e) => {
+    if (ctx.state.stage !== "storyline" || !isLinking(ctx) || e.button !== 0) return;
+    const port = e.target && e.target.closest && e.target.closest(".kb-v13-port");
+    if (!port) return;
+    const node = port.closest(".kb-v13-snode");
+    if (!node || !node.dataset.path) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const layout = layoutFor(ctx, ctx.state.crystalPath);
+    const pos = posMapOf(ctx, ctx.state.crystalPath, layout);
+    const from = pos.get(node.dataset.path) || { x: 0, y: 0 };
+    drag = {
+      id: e.pointerId,
+      fromPath: node.dataset.path,
+      side: port.dataset.side,
+      start: portPos(from, port.dataset.side),
+    };
+    const svg = ensureLinkLayer(ctx);
+    const line = svgEl("line");
+    // 颜色说的是"这一下松开会怎样"（3.0 刀 13）：写模式落蓝双链、看模式落金线。
+    line.setAttribute(
+      "class",
+      "kb-v13-slink kb-v13-slink-rubber" +
+        (ctx.state.linkWrite ? "" : " kb-v13-slink-rubber-manual")
+    );
+    svg.appendChild(line);
+    ctx._rubber = line;
+    ctx._rubberSide = port.dataset.side;
+  });
+
+  g.addEventListener("pointermove", (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const pz = ctx._panzoom;
+    if (!pz || !ctx._rubber) return;
+    const w = pz.clientToWorld(e.clientX, e.clientY);
+    const fromSide = ctx._rubberSide || "right";
+    // 3.0 刀 13：这一档决定**松手会得到什么**，而预览必须说同一件事。
+    const write = !!ctx.state.linkWrite;
+
+    // **橡皮筋画出松手后的那个形状**，不是一条临时曲线。
+    //
+    // 指针底下正好压着一张别的卡时，连"扎进它哪一边"都能算出来（nearestSide），
+    // 于是预览和落地**逐点同形**——松手那一刻线不会跳。
+    // 落在空白处就按"横着出去、再拐到鼠标"画，那正是这根线真连上时的走法。
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    const node = under && under.closest && under.closest(".kb-v13-snode");
+    const toPath = node && node.dataset.path;
+    const pos = posMapOf(ctx, ctx.state.crystalPath, layoutFor(ctx, ctx.state.crystalPath));
+    const target = toPath && toPath !== drag.fromPath ? pos.get(toPath) : null;
+    const toSide = target ? nearestSide(target, w) : null;
+    const svg = ensureLinkLayer(ctx);
+    // 颜色说的是"这一下松开会怎样"：写模式落的是蓝双链，看模式落的是金线。
+    // 两档共用同一个基类（青 = 蓝双链的颜色），只有看模式多加一个后缀类换成金色。
+    const cls =
+      "kb-v13-slink kb-v13-slink-rubber" + (write ? "" : " kb-v13-slink-rubber-manual");
+
+    // 3.0 刀 14：蓝线也改成折线了（见 paintStoryLines 里 drawLine 那段），
+    // 所以**两档共用这一支**——预览的形状和落地的形状从这一刀起是同一个。
+    // 剩下的差别只有颜色：写模式青（蓝双链）、看模式金（手工线）。
+    let pts;
+    if (target) {
+      pts = routePoints(drag.start, fromSide, portPos(target, toSide), toSide, []);
+    } else {
+      // 空白处：**一根引线加一个直角，直接停在指针上**。
+      // 这里绝不能调 routePoints——那条路遇到"目标在身后"会绕一个大 U，
+      // 而拖拽过程中指针绕着走一圈是常事，屏幕上会甩出一条巨大的回形针。
+      // 落在空白**什么都不会发生**，所以形状本身不是承诺。
+      const dir = SIDE_DIR[fromSide] || { x: 1, y: 0 };
+      const s0 = step(drag.start, dir, STUB);
+      const elbow = axisOf(fromSide) === "h" ? { x: w.x, y: s0.y } : { x: s0.x, y: w.y };
+      pts = dedupe(orthogonalize([drag.start, s0, elbow, w], axisOf(fromSide)));
+    }
+    const next = svgEl("path");
+    next.setAttribute("d", roundedPath(pts));
+    next.setAttribute("fill", "none");
+    next.setAttribute("class", cls);
+    svg.replaceChild(next, ctx._rubber);
+    ctx._rubber = next;
+  });
+
+  const end = (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const d = drag;
+    drag = null;
+    const svg = ensureLinkLayer(ctx);
+    if (ctx._rubber && ctx._rubber.parentNode === svg) svg.removeChild(ctx._rubber);
+    ctx._rubber = null;
+
+    // 落在哪张卡上，看的是**指针底下那个元素**。橡皮筋是 svg 里的线、
+    // pointer-events:none，不会挡在中间（否则 elementFromPoint 永远命中它）。
+    const target = e.target && e.target.closest && e.target.closest(".kb-v13-snode");
+    const toPath = target && target.dataset.path;
+    if (!toPath || toPath === d.fromPath) return; // 落在空白或自己身上 = 不连
+    // 落点在卡片的哪一边。**两条路都要**（写模式记接法提示、看模式记金线），
+    // 所以提到写模式那个分支**前面**算一次——原来它长在下面那条路上，
+    // 于是写模式永远算不到边（3.0 刀 13）。
+    const layout = layoutFor(ctx, ctx.state.crystalPath);
+    const pos = posMapOf(ctx, ctx.state.crystalPath, layout);
+    const b = pos.get(toPath);
+    if (!b) return;
+    // 落在卡片的哪一边就记哪一边——线接在该接的地方，不是一刀切连到中心
+    const w = ctx._panzoom ? ctx._panzoom.clientToWorld(e.clientX, e.clientY) : { x: b.x, y: b.y };
+    const toSide = nearestSide(b, w);
+
+    // 3.0 刀 9-D：**写入型**连线（用户 09-19 要的「通过连线来写入谁链接谁」）。
+    //
+    // 同一根拖拽动作，两种落法，由结构窗那颗模式按钮切：
+    //   · 关（默认）——落一根**视觉金线**，只存在库里，不碰笔记（原样）；
+    //   · 开           ——往**源卡正文**里写一条 `[[目标卡]]`，笔记跟着变。
+    //
+    // 落法是问 `ctx.writeStoryLink`，不在这里直接写盘：这一层不认识适配层，
+    // 而且写正文要走 `patchBody` + 基线比对 + 一次撤销那一整套（见 reader.js
+    // 的 writeBacklink），那些都不该长在画线的地方。
+    if (ctx.state.linkWrite) {
+      // 3.0 刀 13（用户 09-20）：「连蓝色双链……通过节点的连接来控制」。
+      //
+      // 记在 writeStoryLink **之前**：它是异步的，等它回来再记的话用户中途关窗
+      // 就丢了；而且它成功之后自己重画一遍，提示得先在场上才画得对。
+      //
+      // 写失败（冲突 / 文件不在了）**也照记**——记的是"他拖的这一下"，
+      // 不是"这次写盘成没成"。一条没有对应双链的提示什么都不影响：没人查它。
+      writeLinkSide(ctx, d.fromPath, toPath, d.side, toSide);
+      if (ctx.writeStoryLink) ctx.writeStoryLink(d.fromPath, toPath);
+      return;
+    }
+    const list = manualLinks(ctx).filter((l) => !(l.from === d.fromPath && l.to === toPath));
+    list.push({ from: d.fromPath, to: toPath, fromSide: d.side, toSide });
+    writeManualLinks(ctx, list);
+    if (ctx.refreshStoryline) ctx.refreshStoryline();
+  };
+  g.addEventListener("pointerup", end);
+  g.addEventListener("pointercancel", end);
+
+  // 左键点空白退出。**排在右键那条之后**：右键不会带出 click，
+  // 所以不会刚进去就被这一下顶出来。
+  g.addEventListener("click", (e) => {
+    if (ctx.state.stage !== "storyline" || !isLinking(ctx)) return;
+    if (e.target && e.target.closest && e.target.closest(".kb-v13-snode")) return;
+    setLinking(ctx, false);
+  });
+}
+
+/**
+ * 「正在摆弄这张关系图」的时候**点卡片不进卡**。
+ *
+ * 两档都归它管，理由一样——那一下的意图是操作图，不是读卡：
+ *   - **连接模式**：用户明确要的，"这个时候无法单击进入卡片"。
+ *   - **连线编辑模式**：不挡的话后果更隐蔽——卡片面板是全屏的，
+ *     双击线身加拐点的**第一下**就把面板弹出来了，第二下打在面板上，
+ *     `dblclick` 压根到不了线。而金线大半都压在别的卡上，
+ *     于是"双击加拐点"在最常用的位置上**永远失灵**，看着像没做。
+ *     （这条是 trace 出来的：down→clk→开面板→down(holo-body)→dbl(holo-body)。）
+ *
+ * 走**捕获阶段**：要抢在「点节点开面板」那条（冒泡阶段）之前把它拦下来。
+ * 同一个元素上的两个监听器之间 stopPropagation 是没用的，
+ * 而这个在 canvas 上、那个在 canvas 上——所以必须靠捕获先到。
+ */
+export function bindLinkGuard(ctx) {
+  ctx.canvas.addEventListener(
+    "click",
+    (e) => {
+      if (ctx.state.stage !== "storyline") return;
+      if (!isLinking(ctx) && !isLineEdit(ctx)) return;
+      const el = e.target && e.target.closest && e.target.closest(".kb-v13-snode");
+      if (!el) return;
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+    },
+    true
+  );
+}
+
+// ============================================================
+// 选中一根金线 / 在它上面加拐点 / 把它删掉（3.0 刀 5 第二轮）
+// ============================================================
+//
+// 交互都是用户定的：
+//   - **双击线身** → 在那儿加一个拐点（拖那个圆点可以摆位置，再双击去掉）
+//   - **左键单击线身** → 选中（选中才有拐点抓手）
+//   - **右键线身** → 弹出「删除实线」
+//   - 右键**空白处**仍是进连接模式——所以右键那条要先做命中判定，
+//     顺序反了的话，想删线的人会被弹进连接模式，而他找不到退出的理由
+//
+// 线的命中判定只能自己算：SVG 里的线是 `pointer-events:none`（世界层也是），
+// 事件永远轮不到它们。所以画的时候把每根线**走过的折线**留在 `ctx._manualHit`
+// 里，拿指针的世界坐标去比距离。
+
+/** 命中容差（屏幕像素）。除以相机缩放，于是放大缩小时手感一样 */
+const HIT_TOL = 9;
+
+/** 点到线段的最短距离，外加落点在这条线段上的**参数**（用来判断插在第几个拐点前） */
+function projectOn(pts, p) {
+  let best = { d: Infinity, at: 0 };
+  let acc = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    const vx = b.x - a.x;
+    const vy = b.y - a.y;
+    const L = Math.hypot(vx, vy);
+    let t = L > 0.001 ? ((p.x - a.x) * vx + (p.y - a.y) * vy) / (L * L) : 0;
+    t = Math.max(0, Math.min(1, t));
+    const d = Math.hypot(p.x - (a.x + t * vx), p.y - (a.y + t * vy));
+    if (d < best.d) best = { d, at: acc + t * L };
+    acc += L;
+  }
+  return best;
+}
+
+/** 指针底下那根金线（世界坐标）。没有就返回 null。 */
+export function hitManual(ctx, world) {
+  const k = (ctx._panzoom && ctx._panzoom.camera().k) || 1;
+  const tol = HIT_TOL / k;
+  let best = null;
+  let bestD = tol;
+  for (const g of ctx._manualHit || []) {
+    const d = projectOn(g.pts, world).d;
+    if (d < bestD) {
+      bestD = d;
+      best = g;
+    }
+  }
+  return best;
+}
+
+// ============================================================
+// 「连线编辑」模式：右键进，按住 S 框选，按 D 删掉（3.0 刀 5 第三轮）
+// ============================================================
+//
+// 交互是用户定的，**换掉了原来那套"左键点选中 + 右键弹删除实线"**：
+//
+//   右键点金线      → 进编辑模式
+//   点顶栏「选框」   → 鼠标变方框，这时拖鼠标就是框选
+//   点「删除实线」/ 按 D → 把选中的全删掉
+//   Esc / 点空白     → 退出
+//
+// 为什么换掉原来那套：一条条点着删，线一多就是几十下。框选 + 一次删
+// 是把"整理连线"当一件事做，而不是当成 N 次单独的操作。
+//
+// 为什么要有「选框」这个开关、而不是直接拖就是框选：编辑模式里普通的拖动
+// 仍然是**平移画面**。没有一个明确的开关的话，手一抖就把画布拖成了框选。
+//
+// 编辑模式下还会把**所有**拐点抓手摆出来（不再要求先选中哪一根）——
+// 左键选中既然去掉了，抓手就得有个不依赖它的出场方式，
+// 而"进了编辑模式 = 这些线都能动"本来就是这件事最自然的说法。
+
+/** 编辑模式开着吗（运行时状态，**不落盘**——它是一次操作中途的状态，不是场景） */
+export function isLineEdit(ctx) {
+  return !!ctx.state.lineEdit;
+}
+
+export function setLineEdit(ctx, on) {
+  const next = !!on;
+  if (ctx.state.lineEdit === next) return false;
+  ctx.state.lineEdit = next;
+  if (!next) {
+    clearPicked(ctx);
+    // 选框开关跟着模式一起关：它只在编辑模式里有意义，
+    // 留着的话下次右键进模式时鼠标会**一进来就是框**，而用户没点过那颗按钮。
+    ctx.state.marqueeArm = false;
+    // 3.0 刀 30：卡档同理，而且更明显——它是顶栏另一颗按钮点开的，
+    // 留着的话下次进编辑模式那颗按钮会亮着「框：卡」，而用户这一轮没点过它。
+    ctx.state.marqueeCard = false;
+    if (ctx.fs) ctx.fs.classList.remove("kb-v13-marquee-arm");
+  }
+  if (ctx.fs) ctx.fs.classList.toggle("kb-v13-lineedit", next);
+  if (ctx.refreshStageUi) ctx.refreshStageUi();
+  refreshLineHint(ctx);
+  redrawStoryLines(ctx);
+  return true;
+}
+
+/** 那行说明条：现在选了几根、下一步按什么。没选中时告诉人怎么选。 */
+export function refreshLineHint(ctx) {
+  const el = ctx.lineHint;
+  if (!el) return;
+  if (ctx.state.stage !== "storyline") {
+    el.style.display = "none";
+    return;
+  }
+  // 3.0 刀 32 在这里写过一支「不在编辑模式、但选中了框」的文案；刀 34 把
+  // "选中框"整套撤了（框不走格点，也就没什么可挪的），那一支跟着没了。
+  // 现在说明条只在编辑模式里出现——**能选中东西的只有卡档框选，而它在编辑模式里**。
+  if (!isLineEdit(ctx)) {
+    el.style.display = "none";
+    return;
+  }
+  const kind = marqueeKind(ctx);
+  const card = kind === "card";
+  const blue = kind === "blue";
+  const n = card ? cardSel(ctx).length : (blue ? blueSel(ctx) : marqueeSel(ctx)).length;
+  // 文案按"此刻该做什么"分三档。顶栏那颗「选框」是这套交互唯一的入口，
+  // 说明条的第一句就得把它指出来——否则用户只会盯着线发呆。
+  //
+  // 3.0 刀 16：蓝线那一档多一句「会从笔记里删掉」。**这几个字不能省**——那是
+  // 全窗唯一改用户手写内容的路，而确认弹窗是用户 09-20 明确不要的，
+  // 说明条就是仅有的告知。
+  //
+  // 3.0 刀 30：卡档多一句「按住其中任意一张拖走」。框选完了站在那儿不动是
+  // **默认会发生的事**——用户不知道下一步是"拖其中一张"的话，框选就白做了。
+  // ⚠️ 3.0 刀 41：这一条**库和结构窗共用**，而「删除卡片」只有结构窗有
+  // （库里卡档仍然只有移动）。所以在这里问一句能力，不把按钮名写死——
+  // 写死的话，库里那条说明会指着一颗根本不存在的按钮。
+  // 同 adapter.js 那条纪律：**一个能力问句 + 一个兜底**。
+  const canDelCards = !!ctx.cardDelete;
+  // 3.0 刀 53（用户 10-01）：**写模式下右键那一档不要这条说明。**
+  //
+  // 那一档是"右键空白处 → 进删蓝线模式"：屏幕上什么都没选中、选框也还没开，
+  // 弹一句「点顶栏「选框」，然后拖出方框」纯属噪音——他不是刚学会这一步的人。
+  //
+  // ⚠️ 判据必须**同时**卡 `blue`。看模式下右键**金色**线进的是**同一个**
+  //    `n === 0 && 没开选框` 分支，而**那一条要留着**：金子线框选唯一的入口
+  //    就是顶栏那颗按钮，少了这句用户只会盯着线发呆（这也是它当初被写出来的理由）。
+  if (!n && !isMarqueeArmed(ctx) && blue) {
+    el.classList.remove("kb-v13-linehint-hit");
+    el.style.display = "none";
+    return;
+  }
+  el.textContent = n
+    ? card
+      ? "已选中 " + n + " 张卡 · 按住其中任意一张拖走，整批一起动（拖进/拖出方框也一样）· " +
+        (canDelCards ? "点「删除卡片（" + n + "）」连文件一起删（进回收站）· " : "") +
+        "方向键一格一格挪 · Esc 退出"
+      : blue
+        ? "已选中 " + n + " 根蓝色线 · 点「删除蓝线」或按 D（会从笔记里删掉）· Esc 退出"
+        : "已选中 " + n + " 根金色线 · 点「删除实线」或按 D · Esc 退出"
+    : isMarqueeArmed(ctx)
+      ? card
+        ? canDelCards
+          ? "拖动鼠标，框住卡片——可以整批拖走，也可以整批删掉 · Esc 退出"
+          : "拖动鼠标，框住要挪的卡片 · Esc 退出"
+        : blue
+          ? "拖动鼠标，框住要删的蓝色线（删的是笔记里的 [[链接]]）· Esc 退出"
+          : "拖动鼠标，框住要删的金色线 · Esc 退出"
+      : "点顶栏「选框」，然后拖出方框 · Esc 退出";
+  el.classList.toggle("kb-v13-linehint-hit", n > 0);
+  el.style.display = "block";
+}
+
+/** 框选中的那些线（存 from/to 这一对，和 cardLinks 里的条目一一对应） */
+export function marqueeSel(ctx) {
+  return Array.isArray(ctx.state.marqueeSel) ? ctx.state.marqueeSel : [];
+}
+
+/** 框选中的蓝线（同样存 from/to；来源是 `_blueHit`，不是 cardLinks） */
+export function blueSel(ctx) {
+  return Array.isArray(ctx.state.blueSel) ? ctx.state.blueSel : [];
+}
+
+/**
+ * 框选中的卡片（3.0 刀 30）。存的是**卡片路径**，不是节点元素——
+ * 元素每帧重建，存它等于存了一个下一帧就失效的东西。
+ *
+ * 单独一张表，**不并进 `marqueeSel`**：那张表里每一条是 `{from,to}`，
+ * 和路径是两种形状，混着放的话 `deletePicked` 会把路径当线去查。
+ */
+export function cardSel(ctx) {
+  return Array.isArray(ctx.state.cardSel) ? ctx.state.cardSel : [];
+}
+
+/**
+ * 把"选中了哪几张卡"这个状态**刷到现成的节点元素上**，不重建 DOM。
+ *
+ * 为什么需要这么一条：框选过程中每一帧走的都是 `redrawStoryLines`，
+ * 而它**只碰 SVG**（见它顶上那条「绝不能重建节点」——被拖的那个元素一换掉，
+ * 指针捕获就没了）。所以选中高亮得另有一条只改类名的路。
+ */
+/**
+ * 方向键一格一格挪（3.0 刀 32，用户 09-28 拍板「两个都要」）。
+ *
+ * 挪的是**框选中的卡片**。
+ *
+ * ⚠️ 3.0 刀 34（用户 09-29）：「把收纳方框的格点移动取消」——**框不再参与**。
+ * 连带把"点标题栏选中一个框"那一整套也撤了：框既然不能用方向键挪，
+ * 那个高亮就只是个亮着却按不动的选中态，比不亮更糟（这一族里最忌讳的
+ * 「点了没反应」）。框还是能拖、能改名、能收起、能删——只是不再"被选中"。
+ *
+ * @param {number} dx 像素。调用方给的是 `±STEP_X` / `±STEP_Y`（单位怎么算的见 storygrid）
+ */
+export function nudgeSelection(ctx, dx, dy) {
+  const cards = cardSel(ctx);
+  if (!cards.length) return false;
+  const l = layoutOf(ctx);
+  if (!l.crystalPos) l.crystalPos = {};
+  // 卡片：**每张各自吸到格点上**。整批拖走时不能各自吸（会把错开半格的两张揉到
+  // 一起），但**方向键是另一回事**——按一下的意图就是"都给我对上格"，
+  // 而且一次只走一格，各自归位正是他要的。
+  for (const p of cards) {
+    const card = ctx.model.byPath.get(p);
+    if (!card) continue;
+    const at = nodePosOf(ctx, card, layoutFor(ctx, ctx.state.crystalPath));
+    const to = snapPos(at.x + dx, at.y + dy, NODE_H);
+    // 与拖动同一条分工：外来卡记进 `importPos`（且不写文件），原生卡写 `crystalPos`
+    // 并把坐标落进它的 frontmatter。
+    if (isForeign(ctx, p)) {
+      setImportPos(ctx, p, to);
+      continue;
+    }
+    l.crystalPos[p] = to;
+    queueCardPos(ctx, p, to);
+  }
+  applyStorylinePositions(ctx, ctx.state.crystalPath || []);
+  if (ctx.refreshStoryline) ctx.refreshStoryline();
+  else applyCardPicked(ctx);
+  if (ctx.refreshStageUi) ctx.refreshStageUi();
+  return true;
+}
+
+/**
+ * 此刻有东西可以被方向键挪吗（决定那四个键归不归我们）。
+ *
+ * ⚠️ **不能只看表非空**——表里可能只剩"已经不在了的东西"（选中之后那张卡被删了
+ * 或者改了名）。后果不是"挪不动"这么轻：**这四个键会被永远认领**，
+ * 结构窗里方向键从此翻不了页，而且一声不响。
+ *
+ * 所以这里**逐个验真身**（`byPath` 是 O(1) 的）。
+ */
+export function hasNudgeSel(ctx) {
+  const byPath = ctx.model && ctx.model.byPath;
+  if (!byPath) return false;
+  for (const p of cardSel(ctx)) if (byPath.get(p)) return true;
+  return false;
+}
+
+export function applyCardPicked(ctx) {
+  const sel = new Set(cardSel(ctx));
+  const host = ctx.canvas;
+  if (!host || !host.querySelectorAll) return;
+  for (const el of host.querySelectorAll(".kb-v13-snode")) {
+    const p = el.dataset.path;
+    if (!p) continue; // 幽灵节点没有路径，永远不参与选中
+    el.classList.toggle("kb-v13-snode-picked", sel.has(p));
+  }
+}
+
+/**
+ * 这次框选**扫的是什么**（3.0 刀 16 的线，3.0 刀 30 加的卡）。
+ *
+ * 三种返回值：
+ *   `"manual"` 金色手工线   `"blue"` 笔记正文里的 `[[链接]]`   `"card"` 卡片
+ *
+ * ⚠️ **卡是独立一档，不是"第四种线"**：`card` 由 `marqueeCard` 那个开关单独决定，
+ * 而且它一开着就**压过**线那两档。这么切是因为线那两档是**右键**定的
+ * （右键落在金线上 = manual、落在空白 = blue），而卡档只能由顶栏那颗按钮点开
+ * ——两条入口写同一个字段的话，右键一次就把用户点开的卡档踢掉了。
+ */
+export function marqueeKind(ctx) {
+  if (ctx.state.marqueeCard) return "card";
+  return ctx.state.marqueeKind === "blue" ? "blue" : "manual";
+}
+
+/** 这一趟框选扫的是卡片吗（框选卡片、整批拖走那一档） */
+export function isCardMarquee(ctx) {
+  return !!ctx.state.marqueeCard;
+}
+
+/**
+ * 在「框线」和「框卡」之间换档（3.0 刀 30，用户 09-27 拍板的 B）。
+ *
+ * 这是**跟顶栏那颗按钮一对**的开关，不是右键那种"顺手切一下"。换档要把上一档
+ * 的选中整个作废：线档选的是 `from/to`、卡档存的是卡片路径，两张表混在一起的话
+ * 按钮上的数字和按下去真正动的东西就对不上了（同 `setMarqueeKind` 那条）。
+ */
+export function setCardMarquee(ctx, on) {
+  const next = !!on;
+  if (!!ctx.state.marqueeCard === next) return false;
+  ctx.state.marqueeCard = next;
+  clearPicked(ctx);
+  if (ctx.refreshStageUi) ctx.refreshStageUi();
+  refreshLineHint(ctx);
+  redrawStoryLines(ctx);
+  applyCardPicked(ctx);
+  return true;
+}
+
+/**
+ * 记住「这一次要删哪一种」。**只有写模式下右键那两处调它。**
+ *
+ * ⚠️ 换了口味就**把上一次的选中清空**：留着的话「删除蓝线（2）」里的 2 指向的是
+ * 两根金线，按下去删的是笔记正文。同值则提前返回——库那一屏「右键金线」那条
+ * 老路会走到这里并立刻返回，什么都不动。
+ *
+ * ⚠️ 调用方要把它排在 `setLineEdit` **前面**：`setLineEdit(ctx, true)` 在已经是
+ * true 时提前返回、根本不刷界面，标签会停在上一档那三个字。
+ *
+ * ⚠️ **3.0 刀 30 起它同时把卡档关掉。** 右键在这个图里的意思从头到尾是同一句
+ * ——「我要摆弄线」；不关的话，人在卡档里右键一下会进到"按钮写着框卡、拖出来
+ * 却是框线"的状态，而那正是这一刀要消灭的那类错。
+ */
+export function setMarqueeKind(ctx, kind) {
+  const next = kind === "blue" ? "blue" : "manual";
+  const wasCard = !!ctx.state.marqueeCard;
+  if (!wasCard && marqueeKind(ctx) === next) return false;
+  ctx.state.marqueeCard = false;
+  ctx.state.marqueeKind = next;
+  clearPicked(ctx);
+  if (ctx.refreshStageUi) ctx.refreshStageUi();
+  refreshLineHint(ctx);
+  redrawStoryLines(ctx);
+  applyCardPicked(ctx);
+  return true;
+}
+
+/**
+ * 把两边的选中连同框选矩形一起清掉。
+ *
+ * 四处退出路径共用（`setLineEdit(false)` / `setMarqueeArm(false)` / `leaveStoryline`
+ * / `bindLineEdit` 的按下），集中一处是为了不漏清一边——漏了 blueSel 的话，
+ * 下次进编辑模式时按钮上那个数字是上一轮留下的。
+ */
+export function clearPicked(ctx) {
+  ctx.state.marqueeSel = [];
+  ctx.state.blueSel = [];
+  // 3.0 刀 30：卡档的选中。**这一条最容易漏**——漏了的话，切回线档之后
+  // 上一轮选中的那几张卡还亮着边，而点「删除实线」删的是线。
+  ctx.state.cardSel = [];
+  ctx.state.marqueeRect = null;
+  // ⚠️ **顺带把屏幕上的高亮也擦掉。** 卡片的选中标记长在节点元素的类名上，
+  // 而这条路有四个调用点，其中两个**完全不会重画节点**（`setLineEdit(false)`
+  // 只重画线；框选起手那一下也是只重画线）。少这一句的表现是：退出编辑模式之后
+  // 那几张卡还亮着边，而此刻点它们已经没有任何特殊含义了——用户会以为还选着。
+  applyCardPicked(ctx);
+}
+
+/**
+ * 「选框」开着吗——开着的时候鼠标一拖就是框选，不再是平移画面。
+ *
+ * ⚠️ **原来设计成"按住 S 再拖"，那个在真机上是坏的**，原因很隐蔽：
+ * 库是嵌在笔记里的一个块，点它**不会把焦点从编辑器手里拿走**（库里的元素
+ * 都不可聚焦），于是按 S 时 keydown 的 target 是编辑器的 contenteditable，
+ * 被我的守卫判成"正在打字"直接忽略；真让它过去更糟——那个 s 会打进笔记正文。
+ *
+ * 改成顶栏一颗按钮：**看得见、点得到、跟焦点没关系**，拖的时候也不必
+ * 一边按着键盘一边拖鼠标。
+ */
+export function isMarqueeArmed(ctx) {
+  return !!ctx.state.marqueeArm;
+}
+
+export function setMarqueeArm(ctx, on) {
+  const next = !!on;
+  if (ctx.state.marqueeArm === next) return false;
+  // 框选只活在编辑模式里：从连接模式点「选框」时顺手把模式切过去。
+  // 两个模式本来就互斥（右键点线也是这么切的）。
+  if (next) {
+    // **也要退出连接模式**。不退的话屏幕上同时挂着连接点、又能框选，
+    // 而且更糟：选框开着时按下就先被框选抢走了（捕获 + stopImmediate），
+    // 从连接点拖线的那个手势**永远起不来**——那些小圆点成了摆设。
+    setLinking(ctx, false);
+    if (!isLineEdit(ctx)) setLineEdit(ctx, true);
+  }
+  ctx.state.marqueeArm = next;
+  if (!next) clearPicked(ctx);
+  if (ctx.fs) ctx.fs.classList.toggle("kb-v13-marquee-arm", next);
+  if (ctx.refreshStageUi) ctx.refreshStageUi();
+  refreshLineHint(ctx);
+  redrawStoryLines(ctx);
+  return true;
+}
+
+/** 把选中的那些线删掉。顶栏那颗「删除实线 / 删除蓝线」和 D 键都走这里 */
+export function deletePickedFor(ctx) {
+  const n = deletePicked(ctx);
+  if (ctx.refreshStageUi) ctx.refreshStageUi();
+  return n;
+}
+
+function isPicked(ctx, l) {
+  return marqueeSel(ctx).some((s) => s.from === l.from && s.to === l.to);
+}
+
+/**
+ * 蓝线那一份。形状与 isPicked 一样，只是换一张表。
+ *
+ * ⚠️ **两张表绝不能合并成一张带 kind 的表**——金线和蓝线经常就是**同一对卡片**
+ *    （A→B 那根手工线，和 A 正文里那条 `[[B]]`），按 `from|to` 认条目就会撞键。
+ *    撞了的症状是：框选删掉一根金线，顺手把用户笔记正文里的 `[[…]]` 也挖了。
+ */
+function isPickedBlue(ctx, e) {
+  return blueSel(ctx).some((s) => s.from === e.from && s.to === e.to);
+}
+
+/**
+ * 这个按键该不该归库管。
+ *
+ * 判据是**"屏幕现在是谁的"**，不是"焦点在哪个元素上"——后者在这里必然判错：
+ * 库是嵌在笔记里的一个块，点它不会把焦点从编辑器拿走，按什么键 target 都是
+ * 编辑器的 contenteditable。按"是不是可编辑元素"来判，等于**库开着的时候
+ * 所有快捷键全部失效**（S 键就是这么死的）。
+ *
+ * 两条：库全屏开着；人不在我们自己的编辑表单里（那儿打字必须放行）。
+ */
+function keysAreOurs(ctx) {
+  // 结构窗（3.0 刀 9-D）：它没有「全屏开着」这个说法——**它是一扇窗，
+  // 窗在，这一屏就在**（窗一关，整个视图对象连监听一起销毁，见 embedstory.js）。
+  // 所以它自带标记，不靠 `fs` 上那个 `open` 类。
+  //
+  // ⚠️ 漏掉这一支的后果：D（删除）在结构窗里是**死的**，而且不报错——
+  // 框选得好好的、按下去屏幕上什么也不发生。
+  // （这条是写完功能自查时才发现的，测试「框选和删除在窗里能用」钉的就是它。）
+  if (ctx.__embedView) {
+    const a = ctx.doc && ctx.doc.activeElement;
+    return !(a && a.closest && a.closest(".kb-v13-editform"));
+  }
+  if (!ctx.fs || !ctx.fs.classList.contains("open")) return false;
+  // 阅读器是盖在整个库上面的一整块屏。它开着的时候，背后那份故事线**看不见也
+  // 点不到**，可键盘不分可见与否——不挡这一下，人在「结构窗」里按个 D，
+  // 删掉的是背后那份谁也看不见的线（删的还是他自己画的）。
+  // 挡在这里而不是挡在每个键上：这一条是所有快捷键共用的门。
+  if (ctx.reader && ctx.reader.isOpen && ctx.reader.isOpen()) return false;
+  const el = ctx.doc && ctx.doc.activeElement;
+  if (el && el.closest && el.closest(".kb-v13-editform")) return false;
+  return true;
+}
+
+/**
+ * 矩形扫过哪些线。
+ *
+ * 判据是**线段与矩形的重叠**，不是"线段的两个端点都在矩形里"——后者对
+ * 一条横穿整个框的长线完全失效（两个端点都在框外），而那恰恰是框选最常见的用法。
+ *
+ * 我们所有的线段都是**横平竖直**的（routePoints 保证），所以这里用 AABB 重叠
+ * 就够了，而且精确：轴对齐的线段和矩形的重叠等价于两个 AABB 有交集。
+ * 换一条斜线段就得写真正的线段求交，这里不需要。
+ */
+function segHitsRect(a, b, r) {
+  const x0 = Math.min(a.x, b.x);
+  const x1 = Math.max(a.x, b.x);
+  const y0 = Math.min(a.y, b.y);
+  const y1 = Math.max(a.y, b.y);
+  return x1 >= r.x && x0 <= r.x + r.w && y1 >= r.y && y0 <= r.y + r.h;
+}
+
+/**
+ * 这个矩形扫到的所有线（返回 from/to 的列表）。
+ *
+ * `kind` 选看哪一份几何，**默认 `"manual"`**——库那一屏只会走这个默认值，
+ * 所以那条老路一个字没变。
+ */
+function pickInRect(ctx, rect, kind) {
+  const out = [];
+  // 3.0 刀 30：卡档。几何是 `renderStorylineStage` 建的那一份 `_cardHit`，
+  // **和线那两份一样是"画的时候顺手留下的"**——卡片住在世界层里、命中测试
+  // 永远轮不到它们自己（同 `_manualHit` 那条注释）。
+  //
+  // 判的是**矩形与卡片矩形相交**，与线那一档同一条口径（不是"整张卡装进框里"）。
+  // 一把框住整列卡是最常见的用法，要求"完全装进去"会让边上一列永远选不中。
+  if (kind === "card") {
+    for (const g of ctx._cardHit || []) {
+      if (
+        g.x + g.w >= rect.x &&
+        g.x <= rect.x + rect.w &&
+        g.y + g.h >= rect.y &&
+        g.y <= rect.y + rect.h
+      ) {
+        out.push(g.path);
+      }
+    }
+    return out;
+  }
+  if (kind === "blue") {
+    for (const g of ctx._blueHit || []) {
+      const pts = g.pts || [];
+      for (let i = 1; i < pts.length; i++) {
+        if (segHitsRect(pts[i - 1], pts[i], rect)) {
+          out.push({ from: g.from, to: g.to });
+          break;
+        }
+      }
+    }
+    return out;
+  }
+  for (const g of ctx._manualHit || []) {
+    const pts = g.pts || [];
+    for (let i = 1; i < pts.length; i++) {
+      if (segHitsRect(pts[i - 1], pts[i], rect)) {
+        out.push({ from: g.link.from, to: g.link.to });
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/** 把选中的那些线删掉 */
+function deletePicked(ctx) {
+  // 卡档里框选出来的是**卡片**，这一支删的是**线**——按 D 时静默返回。
+  //
+  // ⚠️ 3.0 刀 41：结构窗现在**有**「删除卡片」了，但它**故意不接 D 键**。
+  //    线删错了顶多是画面上少一根（金线）或者正文里少一行（蓝线，还有一层撤销）；
+  //    卡片是**整个文件**。一个裸按键就能把 N 个文件扔进回收站，太容易误触——
+  //    而卡档里手正放在方向键上挪卡片，正是最容易顺手按到 D 的状态。
+  //    要删就走那颗按钮：它上面写着张数、悬停写着代价、说明条再说一遍。
+  //
+  // ⚠️ 也不能让它往下走到 `marqueeSel`：那一支是"把金线从 cardLinks 里删掉"，
+  // 而卡档下 marqueeSel 是空的（换档时清过），走到那儿只是白跑一趟；
+  // 真正危险的是**哪天有人往 marqueeSel 里塞了路径**，那时它会拿路径去比
+  // `l.from`，一条也对不上，于是「按 D 什么也没发生」——看着像坏了。
+  if (marqueeKind(ctx) === "card") return 0;
+  if (marqueeKind(ctx) === "blue") return deletePickedBlue(ctx);
+  const sel = marqueeSel(ctx);
+  if (!sel.length) return 0;
+  const gone = new Set(sel.map((s) => s.from + "|" + s.to));
+  ctx.state.marqueeSel = [];
+  editManual(ctx, (list) => list.filter((l) => !gone.has(l.from + "|" + l.to)));
+  return sel.length;
+}
+
+/**
+ * 蓝线的「删」= **动笔记**（金线只是视图状态）。这是这一屏唯一不可逆的动作。
+ *
+ * 整条交给宿主侧那一份 `removeStoryLinks`：这一层不认识适配层，也不该认识
+ * （同 bindLinkMode 落线时那句注释）。
+ *
+ * ⚠️ 没有 `removeStoryLinks` 时**什么都不做**：库那一屏根本框不到蓝线
+ *    （那边的 kind 永远是 "manual"），真走到这里说明有人把 kind 写错了——
+ *    这时静默返回 0，远好过"按 viewstate 去删一根并不存在的金线"。
+ *
+ * 返回值可能是 Promise（宿主那份是异步的）。两个调用点都**不看返回值**，
+ * 别改依赖它的代码。
+ */
+function deletePickedBlue(ctx) {
+  const sel = blueSel(ctx);
+  if (!sel.length) return 0;
+  ctx.state.blueSel = [];
+  // 按钮当场收起来，别等异步回来——那期间点第二下会拿着空的选中再跑一趟
+  if (ctx.refreshStageUi) ctx.refreshStageUi();
+  refreshLineHint(ctx);
+  if (!ctx.removeStoryLinks) return 0;
+  return ctx.removeStoryLinks(sel.map((s) => ({ from: s.from, to: s.to })));
+}
+
+/** 读—改—写。**一律拷一份改**：manualLinks 给的是草稿里那个数组本身 */
+function editManual(ctx, fn) {
+  // **深一层拷贝 bends**：它是数组，浅拷的话改的是草稿里那个数组本身，
+  // 而"恢复默认"要能把这个改动整个丢掉。
+  const list = manualLinks(ctx).map((l) => {
+    const one = { ...l };
+    if (one.bends) one.bends = one.bends.slice();
+    return one;
+  });
+  const out = fn(list);
+  if (out === false) return false;
+  writeManualLinks(ctx, out || list);
+  redrawStoryLines(ctx);
+  return true;
+}
+
+/** 双击线身：在那儿加一个拐点 */
+function addBend(ctx, geom, world) {
+  const proj = projectOn(geom.pts, world);
+  editManual(ctx, (list) => {
+    const l = list[geom.index];
+    if (!l) return false;
+    const bends = l.bends || [];
+    if (bends.length >= 8) return false; // 再多就不像流程图了，而且没法看
+    // 插在**沿线顺序**该在的位置，不是追加到末尾——否则先点近端、后点远端，
+    // 两个拐点会互换角色，整根线翻个面。
+    const at = bends.map((b) => projectOn(geom.pts, b).at).filter((v) => v < proj.at).length;
+    bends.splice(at, 0, { x: world.x, y: world.y });
+    l.bends = bends;
+    return list;
+  });
+}
+
+/** 双击拐点的抓手：去掉它 */
+function removeBend(ctx, from, to, x, y) {
+  editManual(ctx, (list) => {
+    const l = list.find((k) => k.from === from && k.to === to);
+    if (!l || !l.bends) return false;
+    const i = l.bends.findIndex((b) => Math.abs(b.x - x) < 0.6 && Math.abs(b.y - y) < 0.6);
+    if (i < 0) return false;
+    l.bends.splice(i, 1);
+    if (!l.bends.length) delete l.bends;
+    return list;
+  });
+}
+
+/**
+ * 双击与拖拐点。**和别处一样绑在舞台上**——抓手住在 SVG 里、SVG 在世界层里，
+ * 指针一离开那个 5px 的小圆点，事件就冒泡不到它祖先上了（这条教训见 itemdrag.js）。
+ */
+export function bindBendEditing(ctx) {
+  const g = ctx.stage;
+  let drag = null;
+
+  g.addEventListener("dblclick", (e) => {
+    if (ctx.state.stage !== "storyline" || !ctx._panzoom) return;
+    if (!e.target || !e.target.closest) return;
+    const w = ctx._panzoom.clientToWorld(e.clientX, e.clientY);
+
+    // 拐点只在**编辑模式**里能动。抓手也只在编辑模式里摆出来——外面双击
+    // 凭空加一个看不到抓手的拐点，等于给用户塞了一个他既看不见也拖不着的东西。
+    if (!isLineEdit(ctx)) return;
+    const handle = e.target.closest(".kb-v13-sbend");
+    if (handle) {
+      e.preventDefault();
+      e.stopPropagation();
+      removeBend(ctx, handle.dataset.from, handle.dataset.to, Number(handle.dataset.bx), Number(handle.dataset.by));
+      return;
+    }
+    if (e.target.closest(".kb-v13-port")) return;
+    // 先判线、再判卡片：线常常压在卡上，反过来的话"双击加拐点"在你最想加的
+    // 那个位置（卡片上方那一段）永远加不上。
+    const hit = hitManual(ctx, w);
+    if (!hit) return;
+    if (e.target.closest(".kb-v13-snode")) {
+      // 压在卡上的那一段：只有**真的贴着线**才算数，容差再收紧一点，
+      // 免得想双击卡片的人被塞一个拐点。
+      if (projectOn(hit.pts, w).d > 4) return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    addBend(ctx, hit, w);
+  });
+
+  g.addEventListener("pointerdown", (e) => {
+    if (ctx.state.stage !== "storyline" || e.button !== 0 || !ctx._panzoom) return;
+    if (!e.target || !e.target.closest) return;
+    const handle = e.target.closest(".kb-v13-sbend");
+    if (!handle) return;
+    e.stopPropagation();
+    const svg = ctx._sHandle;
+    if (svg) svg.classList.add("kb-v13-benddrag");
+    drag = {
+      id: e.pointerId,
+      from: handle.dataset.from,
+      to: handle.dataset.to,
+      x: Number(handle.dataset.bx),
+      y: Number(handle.dataset.by),
+      moved: false,
+    };
+  });
+
+  g.addEventListener("pointermove", (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    drag.moved = true;
+    const w = ctx._panzoom.clientToWorld(e.clientX, e.clientY);
+    // 拖动过程中**每一帧都写回草稿并重画**：线是照着拐点算出来的，
+    // 拐点变了而不重算，线就还钉在原来的形状上（和"拖卡片线不动"同一个错）。
+    editManual(ctx, (list) => {
+      const l = list.find((k) => k.from === drag.from && k.to === drag.to);
+      if (!l || !l.bends) return false;
+      const i = l.bends.findIndex((b) => Math.abs(b.x - drag.x) < 0.6 && Math.abs(b.y - drag.y) < 0.6);
+      if (i < 0) return false;
+      l.bends[i] = { x: w.x, y: w.y };
+      drag.x = w.x;
+      drag.y = w.y;
+      return list;
+    });
+  });
+
+  const end = (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const moved = drag.moved;
+    drag = null;
+    if (ctx._sHandle) ctx._sHandle.classList.remove("kb-v13-benddrag");
+    // 拖完那一下会接着冒出一个 click —— 不掐掉的话，它会把刚选中的线取消选中，
+    // 抓手当场消失（这和「拖完晶体顺手打开一张卡」是同一类毛病）。
+    if (moved) swallowNextClick(g);
+  };
+  g.addEventListener("pointerup", end);
+  g.addEventListener("pointercancel", end);
+}
+
+/**
+ * 连线编辑模式：右键进、「选框」开关打开后拖鼠标框选、删除、Esc 退。
+ *
+ * ⚠️ **框选那一下必须走捕获阶段 + `stopImmediatePropagation`**。
+ * 舞台上有三条监听在抢同一次按下：panzoom 的平移、itemdrag 的拖卡片，
+ * 和这里。捕获阶段在冒泡之前，所以这一条总能先拿到；`stopImmediatePropagation`
+ * 再把它后面的（**同元素的**后续监听，`stopPropagation` 管不了这个）一起掐掉。
+ * 少了它，一拖画面就跟着平移——框选框到一半画布跑了。
+ *
+ * 顺序上也依赖"绑定早于 panzoom"：panzoom 是在**进相机档那一刻**才建的
+ * （ensurePanZoom），而这里是 mount 时绑的。落点正好是舞台本身时，
+ * 两者都算"目标节点上的监听"，那时按注册顺序跑——我们的更早。
+ */
+export function bindLineEdit(ctx) {
+  const g = ctx.stage;
+  const doc = ctx.doc || document;
+  let marquee = null; // {id, wx, wy, rect}
+  let ateClick = false; // 刚框完，那一下 click 要吃掉（见 end 里的说明）
+
+  // 屏幕上的说明条。**必须有**：这套交互的入口是顶栏那颗「选框」，
+  // 而按钮上的两个字说不清"点完之后要干嘛"，说明条把下一步补上。
+  const hint = EL("div", "kb-v13-linehint");
+  hint.style.display = "none";
+  g.appendChild(hint);
+  ctx.lineHint = hint;
+
+  // D 键 = 删除。**只是条捷径**，真正靠得住的是顶栏那颗「删除实线」。
+  //
+  // ⚠️ 判定"这个键归不归我们"**不能**用「target 是不是可编辑元素」：
+  // 库嵌在笔记里，点它不会把焦点从编辑器拿走，于是按任何键 target 都是
+  // 编辑器的 contenteditable，被判成打字、整条捷径永远不生效（S 键就是这么
+  // 死掉的）。改成问「库全屏开着吗、人在我们自己的表单里吗」——
+  // 库盖着整个屏幕的时候，键盘本来就该归库。
+  doc.addEventListener("keydown", (e) => {
+    if (ctx.state.stage !== "storyline" || !isLineEdit(ctx)) return;
+    if (!keysAreOurs(ctx)) return;
+    if (e.key === "d" || e.key === "D") {
+      // preventDefault 是**必须的**：不拦的话这个 d 会打进背后那篇笔记的正文里。
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      deletePickedFor(ctx);
+    }
+    // ⚠️ **Esc 不在这里收**。收在这儿就得自己判断"面板/悬浮窗是不是开着"，
+    // 而那正是 app.js 那条 Esc 分流在管的事——两处各判一份，迟早对不上，
+    // 表现是"编辑模式下开着的卡片面板 Esc 关不掉"。统一交给那条分流
+    // （它在连接模式之前加了一条编辑模式的分支）。
+  });
+
+  g.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (ctx.state.stage !== "storyline" || !isLineEdit(ctx) || !ctx._panzoom) return;
+      // 抓手上的按下是"挪拐点"，不归框选管。
+      //
+      // 3.0 刀 31：外来卡上那颗「✕ 拿走」**同理，而且这条是漏网的**——
+      // `itemdrag` 那边早就用 `ignore` 挡住了同一个坑，这里没跟着挡。症状很具体：
+      // 选框开着时点 ✕，只要按下和抬起之间动过 1px（这条路**没有** 4px 阈值），
+      // 它就当场起了一个框选；松手时 `ateClick` 立起来，紧接着那一下 click
+      // 被吃掉 —— **✕ 一声不响地没发生**，屏幕上只闪了个框。纯点击（一像素不动）
+      // 反而是好的，所以这是"手抖才现形"那一类。
+      // 3.0 刀 32：**框的标题栏和抓手也一起放行。**
+      //
+      // 这一条修的是一个一直存在的洞：框的拖动那两下（`_kbBoxDrag`）绑在 `canvas`
+      // 上，而这里是绑在 `stage` 上的**捕获**阶段 + `stopImmediatePropagation`
+      // ——事件根本到不了 canvas。于是「选框」开着的时候，框既拖不动
+      // （老问题），点标题栏也选不中（新的那条路）。而"刚框选完一片卡片"
+      // 恰恰是用户最可能顺手去点一个框的时刻。
+      //
+      // 标题栏和抓手是**控件**，不是"空白画布"——从这里起手框选本来就没什么意义
+      // （那一条只有 20px 高），放行不会让谁少了什么。
+      if (
+        e.target &&
+        e.target.closest &&
+        e.target.closest(".kb-v13-sbend,.kb-v13-snode-unimport,.kb-v13-sbox-bar,.kb-v13-sbox-grip")
+      ) {
+        return;
+      }
+      if (e.button !== 0) return;
+      // **「选框」开着**才框选。关着的时候拖动仍然是平移画面——
+      // 编辑模式里最常做的事还是挪卡片、推画面，不能把拖动整个占掉。
+      if (!isMarqueeArmed(ctx)) return;
+      // 旗子一律在这一下清掉，**不管下面走哪条路**：它是"刚框完那一下 click 要吃掉"，
+      // 而任何一次新的按下都说明那一下 click 早就过去了。留在卡档那条 return 之后
+      // 的话，它会被留到下一次点击——那一下本该是"点空白退出编辑模式"，却被吃掉。
+      ateClick = false;
+      // 3.0 刀 30：卡档里，按在**已经选中的那张卡**上 = 整批一起拖，不归框选管。
+      //
+      // ⚠️ 这一条是"框选完再拖走"能成立的**全部理由**：框一松手，用户的下一个
+      //    动作就是按住其中一张把它拖出去。不放行的话，这一下会重新开一个框选
+      //    ——框选矩形从卡片上起手，一拖就把选中清空，看着像"选好的东西一碰就没了"。
+      //
+      // ⚠️ 这里**只 return，不能 stopPropagation**：这一下要留给 itemdrag 去拖。
+      //    平移那边不会跟着抢——panzoom 的 `onPointerDown` 头一句就是
+      //    `if (e.target !== gesture) return;`，按在卡片上它根本不起手。
+      if (isCardMarquee(ctx)) {
+        const node = e.target && e.target.closest && e.target.closest(".kb-v13-snode");
+        const p = node && node.dataset.path;
+        if (p && cardSel(ctx).indexOf(p) >= 0) return;
+      }
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      const w = ctx._panzoom.clientToWorld(e.clientX, e.clientY);
+      marquee = { id: e.pointerId, x: e.clientX, y: e.clientY, wx: w.x, wy: w.y, rect: null };
+      clearPicked(ctx); // 两边的选中一起清，免得上一轮那一份的数字留在按钮上
+      redrawStoryLines(ctx);
+    },
+    true
+  );
+
+  g.addEventListener("pointermove", (e) => {
+    if (!marquee || e.pointerId !== marquee.id || !ctx._panzoom) return;
+    const w = ctx._panzoom.clientToWorld(e.clientX, e.clientY);
+    // 矩形用**世界坐标**存：相机可能在这一趟里变（缩放），存屏幕坐标的话
+    // 框会跟着漂。换算一次，后面全用它。
+    const rect = {
+      x: Math.min(marquee.wx, w.x),
+      y: Math.min(marquee.wy, w.y),
+      w: Math.abs(w.x - marquee.wx),
+      h: Math.abs(w.y - marquee.wy),
+    };
+    marquee.rect = rect;
+    ctx.state.marqueeRect = rect; // 画图那一步读它
+    // 3.0 刀 16：按这一轮的 kind 去扫**对应的那份**几何。库那一屏的 kind 永远是
+    // "manual"，走的还是 `_manualHit`——那条老路一个字没变。
+    const kind = marqueeKind(ctx);
+    const hits = pickInRect(ctx, rect, kind);
+    if (kind === "card") ctx.state.cardSel = hits;
+    else if (kind === "blue") ctx.state.blueSel = hits;
+    else ctx.state.marqueeSel = hits;
+    redrawStoryLines(ctx);
+    // 卡档的高亮只能这么刷：`redrawStoryLines` 只碰 SVG，而选中标记长在节点上
+    // （它自己顶上那条写着"绝不能重建节点"，理由是指针捕获）。
+    if (kind === "card") applyCardPicked(ctx);
+  });
+
+  const end = (e) => {
+    if (!marquee || e.pointerId !== marquee.id) return;
+    const dragged = !!marquee.rect;
+    marquee = null;
+    ctx.state.marqueeRect = null;
+    // ⚠️ 松手之后紧接着会冒出一个 click，而它的落点就是舞台（框选多半在空白处收尾），
+    // 会正好撞上下面那句"点空白退出编辑模式"——**刚框好的选择当场被清空**，
+    // 于是按 D 什么也不删。表现是"框选高亮闪一下就没了"，极难查。
+    //
+    // 不能靠 swallowNextClick：它是**捕获阶段**挂在舞台上的，而这里 click 的
+    // 目标就是舞台本身，同元素上按注册顺序跑，我们这条（mount 时绑的）永远在它前面。
+    // 所以自己立个旗子，用完就放，下一次 pointerdown 也放（防它漏到下一次点击）。
+    if (dragged) ateClick = true;
+    // 框选结束**把矩形擦掉**，但选中留着——下一步就是按 D。
+    // 矩形一直挂着的话，用户会以为还得再框一次。
+    redrawStoryLines(ctx);
+    if (ctx.refreshStageUi) ctx.refreshStageUi();
+  };
+  g.addEventListener("pointerup", end);
+  g.addEventListener("pointercancel", end);
+
+  // 3.0 刀 32：**方向键 = 一格一格挪**（用户 09-28 拍的「两个都要」）。
+  //
+  // ⚠️ **必须用捕获阶段，而且必须排在阅读器那条前面。** 结构窗开在阅读器里，
+  // 阅读器自己的 keydown（← → / PageUp / PageDown 翻页）绑在 doc 的**冒泡**阶段，
+  // 而且**注册得比这扇窗早**——同元素同阶段按注册顺序跑，轮不到我们，
+  // 页已经翻过去了。捕获阶段永远先于冒泡，这条才抢得到。
+  //
+  // ⚠️ 只在**真的有东西被选中**时才认领：没选中时方向键该干嘛干嘛
+  // （在结构窗里就是翻文献），不然窗一开，读者就再也没法用方向键翻页了。
+  doc.addEventListener(
+    "keydown",
+    (e) => {
+      // 只要在故事线这一屏、**有卡片被选中**就归我们。**不要求处在编辑模式**
+      // ——能选中卡的只有卡档框选，而它本来就在编辑模式里，所以这个"不要求"
+      // 是给将来留的余地，不是现在真会走到的分支。
+      if (ctx.state.stage !== "storyline") return;
+      const step =
+        e.key === "ArrowLeft" ? [-STEP_X, 0]
+        : e.key === "ArrowRight" ? [STEP_X, 0]
+        : e.key === "ArrowUp" ? [0, -STEP_Y]
+        : e.key === "ArrowDown" ? [0, STEP_Y]
+        : null;
+      if (!step) return;
+      if (!hasNudgeSel(ctx)) return;
+      if (!keysAreOurs(ctx)) return;
+      // ⚠️ 窗口收进收纳栏 / 被挂起时尺寸是 0×0（同 `fit()` 那条判据）——
+      // 那会儿按方向键的人找的是别的东西，认领了等于让它在别处静默失效。
+      // （库那一屏没有"窗口"这回事，`getBoundingClientRect` 照样有值。）
+      //
+      // 这一条**顺带挡住一个更隐蔽的情形**：这条监听挂在共享的 `doc` 上，
+      // 而结构窗是可以关掉再开的（`destroy` 只摘了 Esc 那条，没摘这条，
+      // 同 `bindLineEdit` 里 D 键那条的老毛病）。关掉的那扇窗，它的舞台
+      // 已经从 DOM 上摘走——量出来正是 0×0，于是那个"死监听"每次都提前返回，
+      // 不会替一个用户看不见的窗口去认领按键。
+      const r = g.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) return;
+      // ⚠️ **光标在输入框里时不认领。** 这条比看上去细，两个形态判的**不是同一件事**：
+      //
+      //   · **`INPUT` / `TEXTAREA` / `SELECT`：两个形态都排除。** 这是"真的有个输入
+      //     控件在等着收字"——库那一屏也有，方框就地改名那颗
+      //     （`inlinerename.js` 的 `.kb-v13-rename-input`）**不在** `.kb-v13-editform`
+      //     里，`keysAreOurs` 拦不到它。不排除的话：改名时按 ← 光标不动，
+      //     反而把选中的卡片挪了。
+      //   · **`contentEditable`：只有结构窗排除。** 库那一屏压根没有可聚焦的元素，
+      //     `activeElement` **永远**是背后那篇笔记的 contenteditable（见 `keysAreOurs`
+      //     那条）——拿它当判据的话，库里的方向键**永远**不生效。
+      //     而结构窗里出现 contenteditable，就是阅读器右边「边看边记」的正文框。
+      const a = ctx.doc && ctx.doc.activeElement;
+      const tag = a && a.tagName ? String(a.tagName).toUpperCase() : "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (ctx.__embedView && a && a.isContentEditable) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      nudgeSelection(ctx, step[0], step[1]);
+    },
+    true
+  );
+
+  // 点空白退出编辑模式。点卡片不算——那一下是"打开这张卡"，不该顺手把模式收了。
+  g.addEventListener("click", (e) => {
+    if (ctx.state.stage !== "storyline" || !isLineEdit(ctx)) return;
+    if (ateClick) {
+      ateClick = false;
+      return;
+    }
+    if (!e.target || !e.target.closest) return;
+    if (e.target.closest(".kb-v13-snode") || e.target.closest(".kb-v13-sbend")) return;
+    // 点在**线上**也不算空白。这一条是必须的：双击线身加拐点的头一下就是一个
+    // click——按"点空白就退出"处理的话，模式在 dblclick 到达之前就没了，
+    // **双击加拐点永远加不上**（而且看起来像"双击没反应"）。
+    if (hitManual(ctx, ctx._panzoom.clientToWorld(e.clientX, e.clientY))) return;
+    setLineEdit(ctx, false);
+  });
+
+}
+
+/** 离这条边最近的那一侧（决定线接在卡片的哪儿） */
+function nearestSide(node, w) {
+  let best = "left";
+  let bestD = Infinity;
+  for (const s of LINK_SIDES) {
+    const p = portPos(node, s);
+    const d = (p.x - w.x) * (p.x - w.x) + (p.y - w.y) * (p.y - w.y);
+    if (d < bestD) {
+      bestD = d;
+      best = s;
+    }
+  }
+  return best;
+}
+
+export { cardsUnder as storylineCards };

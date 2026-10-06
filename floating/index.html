@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!--
+  关于 CSP（**实测过再收紧**，这里先按保守的写）：
+    · script-src 只放 'self' file: —— 页面里**没有内联脚本**，自举在 entry-floating.js
+      里（见那条注释）。不必为一句 boot() 开 'unsafe-inline'。
+    · connect-src 只放回环 —— 这条是真正的边界：这个窗口能往外发数据的地方只有桥上。
+    · worker-src / child-src 要有 blob: —— pdf.js 的 worker 是 blob URL 起的
+      （core/pdfdoc.js 的 makeWorker）。这一条在 Obsidian 那边是个赌注，
+      在这儿是我们自己说了算。
+    · style-src 带 'unsafe-inline'：核心是**用 JS 建 DOM** 的，会走
+      setAttribute("style", …) 那条路，而那条是受 style-src 管的。
+      留着，代价可接受；真正的安全边界在上面那条 connect-src。
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none';
+               script-src 'self' file:;
+               style-src 'self' file: 'unsafe-inline';
+               img-src 'self' file: data: blob: http://127.0.0.1:*;
+               font-src 'self' file: data:;
+               media-src 'self' file: blob:;
+               connect-src http://127.0.0.1:*;
+               worker-src blob:;
+               child-src blob:;
+               form-action 'none';
+               base-uri 'none'">
+<title>晶体库 · 悬浮</title>
+<!-- 顺序有讲究：先我们的皮肤（声明 Obsidian 变量），再核心的 styles.css。
+     反过来的话，核心那批 `var(--x, 回退值)` 会拿到还没声明的变量，
+     画面会按回退值走——而那正是"看着能用、其实没跟上"的那类偏差。 -->
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- 无边框窗口的拖拽条。**自己造一条，不去注入 CSS 让阅读器顶栏可拖**——
+     那会把伴侣耦合到核心的类名上，而且阅读器顶栏有十几个交互控件，
+     每一个都得再标一遍 no-drag。 -->
+<div id="float-chrome">
+  <span id="float-title">晶体库 · 悬浮</span>
+  <span id="float-status"></span>
+  <span class="float-spacer"></span>
+  <button type="button" id="float-pin" title="置顶开关">置顶</button>
+  <button type="button" id="float-min" title="最小化">—</button>
+  <button type="button" id="float-close" title="关闭">✕</button>
+</div>
+
+<!-- 挂载点。**没有内联脚本**：自举在 bundle 里（entry-floating.js 末尾那段）。 -->
+<div id="kb-float-mount"></div>
+<script src="bundle.js"></script>
+
+</body>
+</html>
