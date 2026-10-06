@@ -117,3 +117,43 @@ html, body {
   border-color: var(--text-accent);
   color: var(--text-on-accent);
 }
+
+/* ── 结构窗那扇：把阅读器自己那条顶栏收起来 ──────────────────
+ *
+ * 那扇窗里要的是**只有结构窗**。底子仍然是阅读器（「换晶体」「导入卡片」
+ * 那两棵树长在阅读器的笔记栏里，脱离阅读器它们就没有落脚处——见 README），
+ * 但阅读器是给"读文献"用的：顶栏那排按钮（文献/翻页/收纳栏…）在一扇
+ * 结构窗里全是噪音，而且会白占一条。
+ *
+ * 结构窗**自己有顶栏**（`.kb-v13-embedbar`：画线：看/写、晶体：X、导入卡片），
+ * 所以收掉这一条不损失任何该有的入口。
+ *
+ * ⚠️ 用 `data-float-role` 属性而不是某个核心类名来判断角色——那是**伴侣自己的**
+ * 标记（entry-floating.js 里设的），换核心类名不会把这条打死。
+ * 收掉之后 `.kb-v13-reader-main` 直接铺满整个阅读器层 = 整个窗口。
+ */
+html[data-float-role="story"] .kb-v13-reader-bar { display: none !important; }
+
+/* ── 边看边记那扇：「只看笔记栏」──────────────────────────────
+ *
+ * 收掉页阵和左边的收纳栏，让右边那条笔记栏（`.kb-v13-reader-side`，平时
+ * 是 320px 定宽）铺满整个窗口。适合把它钉在屏幕一侧当便签用。
+ *
+ * ⚠️ 三个都要 `!important`，因为核心那边这三条都是**行内/flex 长写**：
+ *   · `flex:0 0 320px` —— 不换成 `1 1 auto` 的话它还是 320 宽，右边一大片空
+ *   · 「收纳」那条把 `flex-basis` 动到 0（带 0.22s 过渡）—— 不收掉的话
+ *     用户上次把它收起来过，这一档会开出一扇**什么都没有**的窗
+ */
+html.kb-float-sideonly .kb-v13-reader-sheets { display: none !important; }
+html.kb-float-sideonly .kb-v13-reader-dock { display: none !important; }
+html.kb-float-sideonly .kb-v13-reader-side {
+  display: flex !important;
+  flex: 1 1 auto !important;
+  flex-basis: auto !important;
+  width: auto !important;
+  max-width: none !important;
+  opacity: 1 !important;
+  padding-left: 12px !important;
+  padding-right: 12px !important;
+  border-left: 0 !important;
+}

@@ -1,7 +1,17 @@
 // 悬浮伴侣的 Electron 主进程。
 //
-// 它只管三件事，别的都不管：**开一扇置顶的窗、把桥的地址传进去、窗口位置记住**。
+// 只管三件事：**开窗、把桥的地址传进去、窗口位置记住**。
 // 界面、数据、渲染全在渲染进程里（entry-floating.js → 核心），主进程不碰。
+//
+// ── 两扇窗，不是一个窗换档 ──
+//
+// 用户 2026-10-06 纠正过一次：他要的是**两个功能各自一扇窗**（边看边记一扇、
+// 结构窗一扇，并排放），不是一扇窗切来切去。所以这里按 `role` 管两扇：
+//   · `reader` —— 边看边记（阅读器 + 右边那条笔记栏）
+//   · `story`  —— 结构窗
+//
+// 两扇窗**同属一个进程**：单实例锁仍然只有一把（配置交棒那套机制照旧），
+// 而两扇窗各有各的位置、各有各的状态命名空间（见 entry-floating.js）。
 //
 // ── 关于置顶，spike 量出来的三条 ──
 //   1. `WS_EX_TOPMOST` 确实会被设上，能压过最大化的 Edge（spike/float/topmost-probe.mjs，
@@ -12,15 +22,10 @@
 //      精确复现也不重现。所以这里构造时设、show() 之后再重申一次，并且留一颗
 //      「重新置顶」按钮——代价极小，而那次偶发是真的发生过。
 //
-// ── 关于「桥的地址从哪儿来」，两条路都得通 ──
+// ── 桥的地址从哪儿来，两条路都得通 ──
 //
 //   ① 插件 spawn 我们：命令行带 `--bridge <json>`（正常路径）。
-//   ② 用户自己双击启动：没有 `--bridge`，去读插件留下的**发现文件**
-//      （`%TEMP%/crystal-vault-float.json`）。
-//
-// 第一条第一版只有 ①，于是双击启动是一扇连不上库的死窗。更糟的是它
-// **占住单实例锁**，让插件那两条命令从此静默失效——「装了、好奇双击、
-// 命令再也没反应」，这是最差的第一印象。所以 ② 必须实现。
+//   ② 用户自己双击启动：没有 `--bridge`，去读插件留下的**发现文件**。
 
 import { app, BrowserWindow, ipcMain, screen, shell, dialog } from "electron";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
@@ -32,6 +37,9 @@ const HERE = __dirname;
 
 /** 发现文件名，与 src/companion.js 里那个常量必须一致。 */
 const DISCOVERY_FILE = "crystal-vault-float.json";
+
+const ROLES = ["reader", "story"];
+const roleOf = (cfg) => (cfg && cfg.role === "story" ? "story" : "reader");
 
 /** 从命令行里取 `--bridge <json>`。插件 spawn 我们的时候就是这么传的。 */
 function readBridgeArg(argv) {
@@ -53,106 +61,96 @@ function readBridgeArg(argv) {
  */
 function readDiscovery() {
   try {
-    const raw = readFileSync(join(tmpdir(), DISCOVERY_FILE), "utf8");
-    const d = JSON.parse(raw);
+    const d = JSON.parse(readFileSync(join(tmpdir(), DISCOVERY_FILE), "utf8"));
     if (!d || !d.port || !d.token) return null;
-    // 超过 12 小时当过期（Obsidian 那侧进程肯定换过了）
     const age = Date.now() - Date.parse(d.startedAt || 0);
     if (!Number.isFinite(age) || age > 12 * 3600 * 1000) return null;
-    // pid 还活着吗。signal 0 只探测存在性，不真发信号。
     if (d.pid) {
       try {
-        process.kill(d.pid, 0);
+        process.kill(d.pid, 0); // signal 0 只探测存在性
       } catch {
         return null;
       }
     }
-    return { origin: "http://127.0.0.1:" + d.port, token: d.token, from: "discovery" };
+    return d;
   } catch {
     return null;
   }
 }
 
-/**
- * 命令行给的优先（它是这次请求的明确意图），没有才退回发现文件。
- * 发现文件那条只补 origin/token——cardsFolder 之类还是要插件那边给，
- * 所以插件写的发现文件里也该带（见 companion.js 的 writeDiscovery）。
- */
+/** 命令行给的优先（它是这次请求的明确意图），没有才退回发现文件。 */
 function resolveBridge(argv) {
   const fromArg = readBridgeArg(argv);
   if (fromArg) return fromArg;
   const disc = readDiscovery();
   if (!disc) return null;
-  // 发现文件里也记了 cardsFolder 之类的补充信息，读回来拼上。
-  try {
-    const raw = JSON.parse(readFileSync(join(tmpdir(), DISCOVERY_FILE), "utf8"));
-    return { ...raw, origin: disc.origin, token: disc.token };
-  } catch {
-    return disc;
-  }
+  return { ...disc, origin: "http://127.0.0.1:" + disc.port, token: disc.token };
 }
 
-// ⚠️ 额外数据里**只放命令行那份**：第二个实例存在的唯一理由是"插件要求换一扇窗"，
-// 而插件总是带 `--bridge`。用户双击时额外数据为空 → 第一个实例只把它拉到前台。
-// 单人实例锁。**两个窗口 = 两个写者**，而卡片坐标那几个 flush 是无基线的防抖写。
-const pendingBridge = readBridgeArg(process.argv);
-const gotLock = app.requestSingleInstanceLock(pendingBridge ? { bridge: pendingBridge } : {});
+// ⚠️ 额外数据里**只放命令行那份**：第二个实例存在的唯一理由是"插件要求再开一扇窗"，
+// 而插件总是带 `--bridge`。用户双击时额外数据为空 → 第一个实例把已有窗拉到前台。
+const pendingCfg = readBridgeArg(process.argv);
+const gotLock = app.requestSingleInstanceLock(pendingCfg ? { cfg: pendingCfg } : {});
 
 if (!gotLock) {
-  // 已经有一扇在跑了。**别自己再开一扇**——直接退，让第一个实例去处理
-  // （它会收到 second-instance，见下面）。这便是「装了、好奇双击、
-  // 命令再也没反应」那个坑的正解：不抢，而是把意图交过去。
+  // 已经有实例在跑了。**别自己再开一扇**——直接退，让第一个实例去处理
+  // （它会收到 second-instance）。这便是「装了、好奇双击、命令再也没反应」
+  // 那个坑的正解：不抢，而是把意图交过去。
   app.quit();
 } else {
-  main(pendingBridge || resolveBridge(process.argv));
+  main(pendingCfg || resolveBridge(process.argv));
 }
 
-function main(initialBridge) {
-  // ⚠️ **这里曾经有一句 `app.on("window-all-closed", () => {})`，已经删掉。**
+function main(initialCfg) {
+  // ⚠️ **这里不许覆盖 `window-all-closed`。**
   //
-  // 它当初是为了防「销毁旧窗 → 建新窗」那一瞬窗口数为零时应用自杀
-  // （Electron 在非 macOS 上的默认行为）。但它造出了一个**严重得多**的毛病：
-  // 用户点 ✕ 关掉悬浮窗之后，**进程不退**，变成一个没有窗口的隐形僵尸，
-  // 而它**永久占着单实例锁**——于是插件那两条命令从此再也起不来，
-  // 用户看到的只是"点了没反应"，除非去任务管理器杀进程或重启。
-  // 2026-10-06 首版发出去当天，用户自己就撞上了这个（诊断日志里
-  // 「伴侣退出了 code=0」连报两次）。
-  //
-  // 现在不需要它了：下面的 `createWindow` 是**先建新窗、再销毁旧窗**
-  // （见那个函数最后一行），中间从不会出现零窗口。所以让默认行为生效——
-  // **关掉窗就该退**，那既是用户期望的，也是不让锁泄漏的唯一办法。
-  //
-  // 于是 `window-all-closed` 不再被覆盖。
+  // 首版有过一句 `app.on("window-all-closed", () => {})`，本意是防"关旧窗→建新窗"
+  // 那一瞬应用自杀。代价是**用户点 ✕ 关掉窗之后进程不退**——隐形僵尸，
+  // **永久占着单实例锁**，于是插件那两条命令从此静默失效（2026-10-06 首日
+  // 用户自己撞上）。现在关窗就该退，那既是用户期望的，也是不让锁泄漏的唯一办法。
+  // 重建窗的场景已经不需要它了：`openRole` 是先建新窗再销毁旧窗。
 
-  let win = null;
+  /** role -> BrowserWindow。两扇窗各占一格。 */
+  const wins = new Map();
 
-  /**
-   * 第二个实例来了：把那边的桥配置接过来，**重开一扇窗**。
-   *
-   * 为什么要重开而不是 reload：桥的地址是走 `webPreferences.additionalArguments`
-   * 进渲染进程的，而那个在窗口创建时就定死了，改不了。所以只能重建。
-   * 代价是窗口位置会回到上次保存的那个（每次 move/resize 都存），观感上无感。
-   */
   app.on("second-instance", (_e, argv, _cwd, additionalData) => {
-    const next = (additionalData && additionalData.bridge) || readBridgeArg(argv);
-    if (!next) {
+    const cfg = (additionalData && additionalData.cfg) || readBridgeArg(argv);
+    if (!cfg) {
       // 用户只是又双击了一次图标：把已有的窗拉到前面，别重开。
-      if (win && !win.isDestroyed()) {
-        if (win.isMinimized()) win.restore();
-        win.focus();
+      const first = [...wins.values()].find((w) => w && !w.isDestroyed());
+      if (first) {
+        if (first.isMinimized()) first.restore();
+        first.focus();
       }
       return;
     }
-    createWindow(next);
+    openRole(cfg);
   });
 
-  async function createWindow(bridgeCfg) {
-    const bounds = await loadBounds();
-    const old = win;
-    win = new BrowserWindow({
+  /**
+   * 开（或聚焦）某个 role 的窗。
+   *
+   * **已经有了就只是拉到前面，绝不重开**——重开会把结构窗的相机、阅读器里开着的
+   * 文献全丢掉，而用户点那条命令的意思多半是"让我看看它"。
+   * 要换档（比如结构窗换一颗晶体）在窗里那颗按钮上做，不必经过这里。
+   */
+  async function openRole(cfg) {
+    const role = roleOf(cfg);
+    const exist = wins.get(role);
+    if (exist && !exist.isDestroyed()) {
+      if (exist.isMinimized()) exist.restore();
+      exist.focus();
+      // ⚠️ **桥的地址可能变了**（Obsidian 重启过：端口和 token 都是新的）。
+      // 这种情况只能重开——配置是走 `additionalArguments` 进渲染进程的，
+      // 建窗时定死。所以比一下，不一样才重建。
+      if (exist.__bridgeOrigin === cfg.origin && exist.__bridgeToken === cfg.token) return;
+    }
+
+    const bounds = await loadBounds(role);
+    const win = new BrowserWindow({
       ...bounds,
-      minWidth: 420,
-      minHeight: 320,
+      minWidth: role === "story" ? 360 : 420,
+      minHeight: 280,
       frame: false, // 无边框；拖拽走 chrome 条上的 -webkit-app-region
       resizable: true,
       alwaysOnTop: true, // ① 构造时设
@@ -164,11 +162,12 @@ function main(initialBridge) {
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: false, // preload 要用 contextBridge + 读 process.argv
-        // 桥的地址从这里进渲染进程（见 preload.js）。走命令行而不是写在文件里：
-        // 端口每次启动都不一样，没有可缓存的东西。
-        additionalArguments: ["--float-cfg=" + JSON.stringify(bridgeCfg || {})],
+        additionalArguments: ["--float-cfg=" + JSON.stringify(cfg || {})],
       },
     });
+    win.__role = role;
+    win.__bridgeOrigin = cfg.origin;
+    win.__bridgeToken = cfg.token;
 
     win.once("ready-to-show", () => {
       win.show();
@@ -178,33 +177,39 @@ function main(initialBridge) {
 
     // 窗口位置**存在伴侣自己的 userData 里**，绝不进 Obsidian 的 data.json——
     // 那个跟着 vault 走，笔记本上的坐标会被套到台式机的显示器布局上。
+    // **按 role 分开存**：两扇窗各有各的位置，不然它们会互相搬。
     let saveTimer = null;
     const rememberSoon = () => {
       if (saveTimer) clearTimeout(saveTimer);
       saveTimer = setTimeout(() => {
-        if (win && !win.isDestroyed()) saveBounds(win.getBounds());
+        if (!win.isDestroyed()) saveBounds(role, win.getBounds());
       }, 400);
     };
     win.on("resize", rememberSoon);
     win.on("move", rememberSoon);
+    win.on("closed", () => {
+      if (wins.get(role) === win) wins.delete(role);
+    });
 
     win.loadFile(join(HERE, "index.html"));
+    startWatchdog(win, cfg);
 
-    // 桥断了要让用户**看见**。守着 /health：连续失败就弹一句，而不是留一扇
-    // 正在编辑僵尸文件的窗（README 风险清单第 3 条）。
-    startWatchdog(win, bridgeCfg);
-
-    if (old && !old.isDestroyed()) old.destroy();
+    const old = wins.get(role);
+    wins.set(role, win);
+    if (old && !old.isDestroyed()) old.destroy(); // 先建新的再销毁旧的：不出现零窗口
   }
 
   // 把「这个壳能做的事」交给渲染进程。contextIsolation 开着，只能走 IPC。
-  // 用 `win` 这个可变引用而不是闭包捕获某一扇具体的窗——换窗之后照样指得对。
-  ipcMain.handle("float:minimize", () => win && win.minimize());
-  ipcMain.handle("float:close", () => win && win.close());
-  ipcMain.handle("float:pin", (_e, on) => {
-    if (!win) return false;
-    win.setAlwaysOnTop(!!on, on ? "floating" : undefined);
-    return win.isAlwaysOnTop();
+  // ⚠️ 用 `event.sender` 定位是哪一扇窗，**不要**闭包捕获某一扇——
+  // 两扇窗共用一个 ipcMain，捕获错了就会出现"点 A 的关闭把 B 关了"。
+  const winOf = (e) => BrowserWindow.fromWebContents(e.sender);
+  ipcMain.handle("float:minimize", (e) => { const w = winOf(e); if (w) w.minimize(); });
+  ipcMain.handle("float:close", (e) => { const w = winOf(e); if (w) w.close(); });
+  ipcMain.handle("float:pin", (e, on) => {
+    const w = winOf(e);
+    if (!w) return false;
+    w.setAlwaysOnTop(!!on, on ? "floating" : undefined);
+    return w.isAlwaysOnTop();
   });
   ipcMain.handle("float:openExternal", (_e, url) => {
     const u = String(url || "");
@@ -213,27 +218,42 @@ function main(initialBridge) {
     return true;
   });
 
-  app.whenReady().then(() => createWindow(initialBridge));
+  app.whenReady().then(() => {
+    if (initialCfg) openRole(initialCfg);
+    else {
+      // 双击启动、但发现文件里没有角色：开边看边记那扇（它是主功能）。
+      const disc = readDiscovery();
+      if (disc) openRole({ ...disc, origin: "http://127.0.0.1:" + disc.port, role: "reader" });
+      else openRole({ role: "reader" }); // 连不上桥——窗会开，并说明该从 Obsidian 里打开
+    }
+  });
 }
 
-// ── 窗口位置 ────────────────────────────────────────────────
+// ── 窗口位置（按 role 分开存）────────────────────────────────
 
-function boundsFile() {
-  return join(app.getPath("userData"), "window.json");
+function boundsFile(role) {
+  return join(app.getPath("userData"), "window-" + (ROLES.includes(role) ? role : "reader") + ".json");
 }
 
-async function loadBounds() {
+async function loadBounds(role) {
   let saved = null;
   try {
-    saved = JSON.parse(await readFile(boundsFile(), "utf8"));
+    saved = JSON.parse(await readFile(boundsFile(role), "utf8"));
   } catch {
     saved = null;
   }
+  // 两扇窗的默认摆位错开一点，免得叠得严丝合缝、看起来像只有一扇。
+  const bias = role === "story" ? 60 : 0;
   if (!saved || !Number.isFinite(saved.width) || !Number.isFinite(saved.height)) {
     const p = screen.getPrimaryDisplay().workArea;
-    const w = Math.min(1000, p.width);
+    const w = Math.min(role === "story" ? 900 : 1000, p.width);
     const h = Math.min(720, p.height);
-    return { width: w, height: h, x: Math.round(p.x + (p.width - w) / 2), y: Math.round(p.y + (p.height - h) / 2) };
+    return {
+      width: w,
+      height: h,
+      x: Math.round(p.x + (p.width - w) / 2) + bias,
+      y: Math.round(p.y + (p.height - h) / 2) + bias,
+    };
   }
   // ⚠️ 夹回可见区域：拔掉副屏之后，上次那份坐标会把窗开到屏幕外，
   // 而用户唯一的补救办法是去删一个 JSON 文件。尺寸留着，位置丢掉重新居中。
@@ -249,23 +269,23 @@ async function loadBounds() {
   return { width: w, height: h, x: Math.round(p.x + (p.width - w) / 2), y: Math.round(p.y + (p.height - h) / 2) };
 }
 
-async function saveBounds(b) {
+async function saveBounds(role, b) {
   try {
-    await mkdir(dirname(boundsFile()), { recursive: true });
-    await writeFile(boundsFile(), JSON.stringify(b), "utf8");
+    await mkdir(dirname(boundsFile(role)), { recursive: true });
+    await writeFile(boundsFile(role), JSON.stringify(b), "utf8");
   } catch {
     /* 记不住位置不该影响用 */
   }
 }
 
-// ── 看门狗 ──────────────────────────────────────────────────
+// ── 看门狗（每扇窗各一个）────────────────────────────────────
 
 function startWatchdog(win, cfg) {
   if (!cfg || !cfg.origin) return;
   let strikes = 0;
   let told = false;
   const tick = async () => {
-    if (!win || win.isDestroyed()) return;
+    if (win.isDestroyed()) return;
     try {
       const ctl = typeof AbortController === "function" ? new AbortController() : null;
       const t = setTimeout(() => ctl && ctl.abort(), 3000);
