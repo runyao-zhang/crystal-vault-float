@@ -118,21 +118,77 @@ html, body {
   color: var(--text-on-accent);
 }
 
-/* ── 结构窗那扇：把阅读器自己那条顶栏收起来 ──────────────────
+/* ── 两扇窗都先收掉「晶体库的入口按钮」──────────────────────
  *
- * 那扇窗里要的是**只有结构窗**。底子仍然是阅读器（「换晶体」「导入卡片」
- * 那两棵树长在阅读器的笔记栏里，脱离阅读器它们就没有落脚处——见 README），
- * 但阅读器是给"读文献"用的：顶栏那排按钮（文献/翻页/收纳栏…）在一扇
- * 结构窗里全是噪音，而且会白占一条。
- *
- * 结构窗**自己有顶栏**（`.kb-v13-embedbar`：画线：看/写、晶体：X、导入卡片），
- * 所以收掉这一条不损失任何该有的入口。
- *
- * ⚠️ 用 `data-float-role` 属性而不是某个核心类名来判断角色——那是**伴侣自己的**
- * 标记（entry-floating.js 里设的），换核心类名不会把这条打死。
- * 收掉之后 `.kb-v13-reader-main` 直接铺满整个阅读器层 = 整个窗口。
+ * `mount()` 会把库那一层的 root 塞进 `#kb-float-mount`，而库没打开时它显示的是
+ * 那颗「ARI 晶体知识库 · N 张卡片」的入口按钮（量过：976×80，横在窗顶）。
+ * **悬浮窗里点它是没有意义的**——伴侣不承载晶体库那一层，点了也没东西可开。
+ * 它是库层的残渣，两扇窗都不该有。
  */
-html[data-float-role="story"] .kb-v13-reader-bar { display: none !important; }
+html[data-float-role] #kb-float-mount { display: none !important; }
+
+/* ── 结构窗那扇：**只有那个组件** ────────────────────────────
+ *
+ * 用户 2026-10-07 纠正过一次：要的是「把结构窗那个**组件**单独分出去」，
+ * 不是「把桌面模式的整扇窗端出来」。1.0.2 是后者（开桌面层、桌上摆一扇铺满的
+ * 结构窗），量出来窗里实际有 `.kb-v13-reader-desk` 整个桌面层容器 + 一扇带
+ * 「结构：X 收纳 ✕」顶栏和拖拽角的 `.kb-v13-desk-win`。那不是组件。
+ *
+ * 现在组件是**直接挂**的（见 entry-floating.js 的 bootStory），桌面层根本不参与。
+ * 但阅读器仍然挂着——因为「换晶体」「导入卡片」那两棵树渲染在它的笔记栏里。
+ * 所以这里要把阅读器**它自己的东西**全收掉，只留那两棵树的栖息地：
+ *
+ *   · `.kb-v13-reader-bar`  —— 阅读器顶栏（文献/翻页/桌面/收纳栏…），
+ *                              在一扇结构窗里全是噪音。结构窗**自己有顶栏**
+ *                              （`.kb-v13-embedbar`），收掉不损失任何该有的入口。
+ *   · `#kb-reader-sheets`   —— 页阵（那是读文献用的）
+ *   · `#kb-reader-desk`     —— 桌面层（这一版**不用它**）
+ *   · `#kb-reader-picker`   —— 「选哪份文献」那层铺满整屏的遮罩；这扇窗不开文献，
+ *                              不收掉它会把结构窗整个盖住
+ *   · `#kb-reader-floats`   —— 阅读器自己的悬浮面板容器
+ *
+ * ⚠️ 用 `data-float-role` 而不是某个核心类名来判断角色——那是**伴侣自己的**标记
+ * （entry-floating.js 里设的），核心改类名不会把这一组打死。
+ */
+html[data-float-role="story"] .kb-v13-reader-bar,
+html[data-float-role="story"] .kb-v13-reader-sheets,
+html[data-float-role="story"] .kb-v13-reader-desk,
+html[data-float-role="story"] .kb-v13-reader-picker,
+html[data-float-role="story"] .kb-v13-reader-floats,
+html[data-float-role="story"] .kb-v13-reader-dock { display: none !important; }
+
+/* 挂结构窗那个组件的落脚处。塞在 `.kb-v13-reader-main` 里当 flex 兄弟，
+   于是它和「笔记栏」（那两棵树的栖息地）自然并排——树开出来的时候占右边一条。 */
+#float-story-host {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  position: relative;
+}
+/* 组件自己要在宿主里撑满（它默认是按内容撑的）。 */
+#float-story-host > .kb-v13-embedstory {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+}
+
+/* ── 边看边记那扇：收掉**晶体库自己的导航** ──────────────────
+ *
+ * 顶栏那排里有两种按钮，得分开看：
+ *   · 阅读器自己的 —— 返回 / 换一份 / 上一屏 / 下一屏 / 缩放 / 边看边记 / 收起顶栏
+ *   · **晶体库那个应用自己的** —— 桌面 / ＋页 / 收纳栏 / 卡片盒 / 故事线 / 结构窗
+ *
+ * 后一排是**整个库**的导航（桌面层、收纳栏、卡片盒、故事线…），不是「边看边记」
+ * 这个组件的东西。用户点名要的是「把两个**组件**单独分出去」，所以这一排在
+ * 这扇窗里收掉——尤其那颗「桌面」：按下去会把整个桌面层拉进这扇窗，
+ * 而那正是他两次说不要的东西。结构窗有自己的那扇命令，不必从这里进。
+ */
+html[data-float-role="reader"] #kb-reader-deskbtn,
+html[data-float-role="reader"] #kb-reader-addpage,
+html[data-float-role="reader"] #kb-reader-dockbtn,
+html[data-float-role="reader"] #kb-reader-cardbox,
+html[data-float-role="reader"] #kb-reader-storyline,
+html[data-float-role="reader"] #kb-reader-storywin { display: none !important; }
 
 /* ── 边看边记那扇：「只看笔记栏」──────────────────────────────
  *

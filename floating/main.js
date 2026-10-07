@@ -149,7 +149,10 @@ function main(initialCfg) {
     const bounds = await loadBounds(role);
     const win = new BrowserWindow({
       ...bounds,
-      minWidth: role === "story" ? 360 : 420,
+      // 边看边记那扇要**并排放文献和笔记栏**，420 宽的时候页阵只剩 70px
+      // （实测过：427 宽的窗里 `#kb-reader-sheets` 只有 70×636）——那不是窄，
+      // 那是没法用。抬到 560 让它至少像样。结构窗那扇没这个约束。
+      minWidth: role === "story" ? 360 : 560,
       minHeight: 280,
       frame: false, // 无边框；拖拽走 chrome 条上的 -webkit-app-region
       resizable: true,
