@@ -20,6 +20,9 @@
  */
 
 :root {
+  /* 拖拽条的高度。**两处都引用它，别写死两遍**——下面 `#float-chrome` 用它定高，
+     而阅读器那一层的 `top` 也用它让位。写死两遍的话，改一处就会错开。 */
+  --float-chrome-h: 30px;
   /* 底色 */
   --background-primary: #0e1a29;
   --background-secondary: #05080f;
@@ -74,10 +77,27 @@ html, body {
  * z-index 要**高于阅读器那一层**（`.kb-v13-reader` 是 10020），
  * 否则条被盖住、整个窗口就没法拖了。
  */
+/* ── 拖拽条压在阅读器上面那一条（用户 10-08 报的）────────────────
+ *
+ * 阅读器是 `position:fixed; inset:0`，而拖拽条是 `position:fixed; top:0` 且
+ * `z-index` 更高（10100 对 10020）。两者一叠，**顶栏最上面那一条被拖拽条吃掉**
+ * ——用户看到的是一排按钮被削掉了上半截，而且点不到。
+ *
+ * 正解是让阅读器整层往下让出这一条。`inset:0` 在 `styles.css` 里，而
+ * `styles.css` 是**后加载**的（见 index.html 顶上那段顺序说明），所以这里
+ * 必须用**属性选择器**把它压过去——光写 `.kb-v13-reader` 优先级打平会输。
+ *
+ * ⚠️ 卡片窗（`data-float-cardmode="one"`）也要让：那扇窗里"没有东西"是
+ * 因为组件还没挂上，不是因为它该从 0 开始。
+ */
+html[data-float-role] .kb-v13-reader {
+  top: var(--float-chrome-h);
+}
+
 #float-chrome {
   position: fixed;
   top: 0; left: 0; right: 0;
-  height: 30px;
+  height: var(--float-chrome-h);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -165,6 +185,19 @@ html[data-float-role="story"] #float-story-host {
 html[data-float-role="card"][data-float-cardmode="one"] .kb-v13-reader-bar,
 html[data-float-role="card"][data-float-cardmode="one"] .kb-v13-reader-sheets,
 html[data-float-role="card"][data-float-cardmode="one"] .kb-v13-reader-dock {
+  display: none !important;
+}
+
+/* ⚠️ **「选哪份文献」那张列表要收掉**（用户 10-08 报的："点开一张卡，
+   出来的是在列表里选卡片"）。
+ *
+ * 卡片窗的底子是阅读器，而阅读器**没打开文献**时那张选择器会摊开来
+ * （`inset:0` 铺满整个页区），盖在卡片上面——于是用户点开一张卡，
+ * 看到的是一张列表，卡片被压在下面。
+ *
+ * `display:none` 而不是 `z-index` 往下降：这扇窗里**根本没有"选文献"这回事**，
+ * 它不是被盖住，是不该出现。 */
+html[data-float-role="card"][data-float-cardmode="one"] .kb-v13-reader-picker {
   display: none !important;
 }
 
