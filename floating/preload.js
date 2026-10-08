@@ -21,11 +21,15 @@ function readCfg() {
 
 contextBridge.exposeInMainWorld("__CRYSTAL_FLOAT__", readCfg());
 
-// 渲染进程能对窗口做的四件事。**只暴露动作，不暴露 Electron 对象**——
+// 渲染进程能对窗口做的几件事。**只暴露动作，不暴露 Electron 对象**——
 // 交一个 ipcRenderer 出去等于把整条 IPC 面全打开。
 contextBridge.exposeInMainWorld("__FLOAT_SHELL__", {
   minimize: () => ipcRenderer.invoke("float:minimize"),
   close: () => ipcRenderer.invoke("float:close"),
   pin: (on) => ipcRenderer.invoke("float:pin", !!on),
   openExternal: (url) => ipcRenderer.invoke("float:openExternal", String(url || "")),
+  // 3.0 刀 44：**把一张卡开成它自己的一扇系统窗**。
+  // 传空串 = 一张空白的新卡（「新建卡片」那条命令走这个）。
+  // 渲染进程只能"请求"，真正开窗的是主进程——它才造得出原生窗口。
+  openCard: (path) => ipcRenderer.invoke("float:openCard", String(path || "")),
 });

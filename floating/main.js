@@ -38,8 +38,27 @@ const HERE = __dirname;
 /** 发现文件名，与 src/companion.js 里那个常量必须一致。 */
 const DISCOVERY_FILE = "crystal-vault-float.json";
 
-const ROLES = ["reader", "story"];
-const roleOf = (cfg) => (cfg && cfg.role === "story" ? "story" : "reader");
+const ROLES = ["reader", "story", "card"];
+const roleOf = (cfg) => {
+  const r = cfg && cfg.role;
+  return ROLES.includes(r) ? r : "reader";
+};
+
+/**
+ * 这一扇窗的**唯一键**。
+ *
+ * ⚠️ 卡片窗（3.0 刀 44）是**一张卡一扇窗**，所以键必须带上卡片的路径。
+ * 按 role 当键的话，点开第二张卡只会把第一扇抬到前面——而用户 10-08 要的
+ * 正是「每张卡自己一扇系统窗，浮在所有页面之上、**不随伴侣窗口最小化**」。
+ * 那不是"把方块做大一点"能得到的，得是另一个原生窗口。
+ *
+ * 路径里可能会有 `:` `/` `\` 这些不能进文件名的字符（见 `boundsFile` 的转义）。
+ */
+const keyOf = (cfg) => {
+  const role = roleOf(cfg);
+  if (role !== "card") return role;
+  return "card:" + String((cfg && cfg.path) || "");
+};
 
 /** 从命令行里取 `--bridge <json>`。插件 spawn 我们的时候就是这么传的。 */
 function readBridgeArg(argv) {
@@ -110,7 +129,7 @@ function main(initialCfg) {
   // 用户自己撞上）。现在关窗就该退，那既是用户期望的，也是不让锁泄漏的唯一办法。
   // 重建窗的场景已经不需要它了：`openRole` 是先建新窗再销毁旧窗。
 
-  /** role -> BrowserWindow。两扇窗各占一格。 */
+  /** 窗口键 -> BrowserWindow（见 `keyOf`）。两张卡各占一格，两扇固定窗各占一格。 */
   const wins = new Map();
 
   app.on("second-instance", (_e, argv, _cwd, additionalData) => {
@@ -136,7 +155,8 @@ function main(initialCfg) {
    */
   async function openRole(cfg) {
     const role = roleOf(cfg);
-    const exist = wins.get(role);
+    const key = keyOf(cfg);
+    const exist = wins.get(key);
     if (exist && !exist.isDestroyed()) {
       if (exist.isMinimized()) exist.restore();
       exist.focus();
@@ -146,10 +166,10 @@ function main(initialCfg) {
       if (exist.__bridgeOrigin === cfg.origin && exist.__bridgeToken === cfg.token) return;
     }
 
-    const bounds = await loadBounds(role);
+    const bounds = await loadBounds(role, key);
     const win = new BrowserWindow({
       ...bounds,
-      minWidth: role === "story" ? 360 : 420,
+      minWidth: role === "story" ? 360 : role === "card" ? 320 : 420,
       minHeight: 280,
       frame: false, // 无边框；拖拽走 chrome 条上的 -webkit-app-region
       resizable: true,
@@ -166,6 +186,11 @@ function main(initialCfg) {
       },
     });
     win.__role = role;
+    win.__winKey = key;
+    // ⚠️ **整份 cfg 留着**：渲染进程里点开一张卡时要**再开一扇窗**，而开窗
+    // 需要桥的地址和 token——那份配置是走命令行进来的，主进程不存的话
+    // 就只能去问渲染进程要，而那等于把桥的凭据在进程之间递一圈。
+    win.__cfg = cfg || {};
     win.__bridgeOrigin = cfg.origin;
     win.__bridgeToken = cfg.token;
 
@@ -177,25 +202,25 @@ function main(initialCfg) {
 
     // 窗口位置**存在伴侣自己的 userData 里**，绝不进 Obsidian 的 data.json——
     // 那个跟着 vault 走，笔记本上的坐标会被套到台式机的显示器布局上。
-    // **按 role 分开存**：两扇窗各有各的位置，不然它们会互相搬。
+    // **按键分开存**：两张卡各有各的位置，不然它们会互相搬。
     let saveTimer = null;
     const rememberSoon = () => {
       if (saveTimer) clearTimeout(saveTimer);
       saveTimer = setTimeout(() => {
-        if (!win.isDestroyed()) saveBounds(role, win.getBounds());
+        if (!win.isDestroyed()) saveBounds(key, win.getBounds());
       }, 400);
     };
     win.on("resize", rememberSoon);
     win.on("move", rememberSoon);
     win.on("closed", () => {
-      if (wins.get(role) === win) wins.delete(role);
+      if (wins.get(key) === win) wins.delete(key);
     });
 
     win.loadFile(join(HERE, "index.html"));
     startWatchdog(win, cfg);
 
-    const old = wins.get(role);
-    wins.set(role, win);
+    const old = wins.get(key);
+    wins.set(key, win);
     if (old && !old.isDestroyed()) old.destroy(); // 先建新的再销毁旧的：不出现零窗口
   }
 
@@ -217,6 +242,26 @@ function main(initialCfg) {
     shell.openExternal(u);
     return true;
   });
+  /**
+   * 开一张卡的窗（3.0 刀 44）。
+   *
+   * ⚠️ **这是"每张卡自己一扇系统窗"那条路唯一的入口。** 点卡那一下发生在
+   * **渲染进程**里（卡片盒 / 结构窗都在那儿），而开一个**原生窗口**只有主进程
+   * 做得到——渲染进程能造出来的只有"自己窗口里的一个方块"，那正是用户不要的
+   * （伴侣一最小化它就没了，也拖不出伴侣的窗口）。
+   *
+   * ⚠️ 桥的配置从**发起那一扇窗**上拿（`w.__cfg`），不重新拼：端口和 token
+   * 都在里面，重拼等于把凭据复制一份，两份迟早会不一样。
+   *
+   * 同一张卡再点一次 = `openRole` 里那条"已有就只聚焦"——**不会开出第二扇**。
+   */
+  ipcMain.handle("float:openCard", (e, cardPath) => {
+    const w = winOf(e);
+    if (!w || !w.__cfg) return false;
+    const p = String(cardPath || "");
+    openRole({ ...w.__cfg, role: "card", path: p });
+    return true;
+  });
 
   app.whenReady().then(() => {
     if (initialCfg) openRole(initialCfg);
@@ -231,22 +276,31 @@ function main(initialCfg) {
 
 // ── 窗口位置（按 role 分开存）────────────────────────────────
 
-function boundsFile(role) {
-  return join(app.getPath("userData"), "window-" + (ROLES.includes(role) ? role : "reader") + ".json");
+/**
+ * 窗口位置的**文件名**。
+ *
+ * ⚠️ 卡片窗的键里带着**卡片的路径**，而路径里会有 `/`（`3.资产舱/知识卡片/x.md`）
+ * 甚至 `:` 这类文件名里不能用的字符。直接拼成文件名会**写失败**，而
+ * `saveBounds` 那个空 `catch` 会把它静默吞掉——症状是"这两张卡的位置永远记不住"，
+ * 而且一点错都不报。所以先把键转义成安全字符。
+ */
+function boundsFile(key) {
+  const safe = String(key || "reader").replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 120);
+  return join(app.getPath("userData"), "window-" + (safe || "reader") + ".json");
 }
 
-async function loadBounds(role) {
+async function loadBounds(role, key) {
   let saved = null;
   try {
-    saved = JSON.parse(await readFile(boundsFile(role), "utf8"));
+    saved = JSON.parse(await readFile(boundsFile(key || role), "utf8"));
   } catch {
     saved = null;
   }
-  // 两扇窗的默认摆位错开一点，免得叠得严丝合缝、看起来像只有一扇。
-  const bias = role === "story" ? 60 : 0;
+  // 几扇窗的默认摆位错开一点，免得叠得严丝合缝、看起来像只有一扇。
+  const bias = role === "story" ? 60 : role === "card" ? 120 : 0;
   if (!saved || !Number.isFinite(saved.width) || !Number.isFinite(saved.height)) {
     const p = screen.getPrimaryDisplay().workArea;
-    const w = Math.min(role === "story" ? 900 : 1000, p.width);
+    const w = Math.min(role === "story" ? 900 : role === "card" ? 520 : 1000, p.width);
     const h = Math.min(720, p.height);
     return {
       width: w,
@@ -269,10 +323,10 @@ async function loadBounds(role) {
   return { width: w, height: h, x: Math.round(p.x + (p.width - w) / 2), y: Math.round(p.y + (p.height - h) / 2) };
 }
 
-async function saveBounds(role, b) {
+async function saveBounds(key, b) {
   try {
-    await mkdir(dirname(boundsFile(role)), { recursive: true });
-    await writeFile(boundsFile(role), JSON.stringify(b), "utf8");
+    await mkdir(dirname(boundsFile(key)), { recursive: true });
+    await writeFile(boundsFile(key), JSON.stringify(b), "utf8");
   } catch {
     /* 记不住位置不该影响用 */
   }

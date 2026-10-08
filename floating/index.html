@@ -42,9 +42,10 @@
   <span id="float-title">晶体库 · 悬浮</span>
   <span id="float-status"></span>
   <span class="float-spacer"></span>
-  <!-- 「只看笔记栏」那颗开关**只在边看边记那扇出现**（结构窗没有页阵可藏，
-       entry-floating.js 里按 role 把它藏掉）。 -->
-  <button type="button" id="float-sideonly" aria-pressed="false" title="收起文献区，只留右边那条笔记栏">只看笔记栏</button>
+  <!-- ⚠️ 这里原本有一颗「只看笔记栏」（3.0 刀 43 撤掉）。
+       它靠的是 `.kb-v13-reader-side` 那一栏铺满窗口，而那一栏整个没有了
+       （用户 10-07 改的架构：建卡搬去顶栏「新建卡片」、文件操作搬去「文件改动」）。
+       恢复这一档的前提是先有一样**值得铺满**的东西——今天没有。 -->
   <button type="button" id="float-pin" title="置顶开关">置顶</button>
   <button type="button" id="float-min" title="最小化">—</button>
   <button type="button" id="float-close" title="关闭">✕</button>
