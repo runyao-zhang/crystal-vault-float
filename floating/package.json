@@ -1,7 +1,7 @@
 {
   "name": "crystal-vault-float",
   "productName": "CrystalFloat",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "把晶体库的边看边记与结构窗浮在其它窗口之上。",
   "main": "main.cjs",
   "author": "runyao-zhang",
