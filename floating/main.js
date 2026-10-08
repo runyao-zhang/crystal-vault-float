@@ -262,6 +262,34 @@ function main(initialCfg) {
     openRole({ ...w.__cfg, role: "card", path: p });
     return true;
   });
+  /**
+   * 开（或聚焦）那扇结构窗，顺便让它看某颗晶体（3.0 刀 44）。
+   *
+   * ⚠️ **光"建窗时带 crystal"不够**：那扇窗很可能已经开着，这时候用户点的是
+   * 「换一颗晶体看」——窗已经在了，只是要看的东西变了。所以已有窗那一支要
+   * **把新的 key 送进去**（`float:showCrystal`），而不是只把它抬到前面。
+   * 只抬不换的症状是「点了换晶体，窗亮了，图还是老的那张」。
+   */
+  ipcMain.handle("float:openStory", (e, key) => {
+    const w = winOf(e);
+    if (!w || !w.__cfg) return false;
+    const k = String(key || "");
+    const exist = wins.get("story");
+    if (exist && !exist.isDestroyed()) {
+      if (exist.isMinimized()) exist.restore();
+      exist.focus();
+      if (k) {
+        try {
+          exist.webContents.send("float:showCrystal", k);
+        } catch {
+          /* 送不进去就只是没换晶体，不该把这一下点崩 */
+        }
+      }
+      return true;
+    }
+    openRole({ ...w.__cfg, role: "story", crystal: k });
+    return true;
+  });
 
   app.whenReady().then(() => {
     if (initialCfg) openRole(initialCfg);

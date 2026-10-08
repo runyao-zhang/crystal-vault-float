@@ -32,4 +32,18 @@ contextBridge.exposeInMainWorld("__FLOAT_SHELL__", {
   // 传空串 = 一张空白的新卡（「新建卡片」那条命令走这个）。
   // 渲染进程只能"请求"，真正开窗的是主进程——它才造得出原生窗口。
   openCard: (path) => ipcRenderer.invoke("float:openCard", String(path || "")),
+  // 开（或聚焦）那扇结构窗，并让它看 `key` 这颗晶体。
+  openStory: (key) => ipcRenderer.invoke("float:openStory", String(key || "")),
+  // 已经开着的那扇结构窗**被要求换晶体**（主进程推过来的）。
+  // ⚠️ 只传动作、不传回调回去，所以它是个"单向通知"——渲染进程收到就照做。
+  onShowCrystal: (cb) => {
+    if (typeof cb !== "function") return;
+    ipcRenderer.on("float:showCrystal", (_e, key) => {
+      try {
+        cb(String(key || ""));
+      } catch {
+        /* 换不过去不该把这一扇搞崩 */
+      }
+    });
+  },
 });
